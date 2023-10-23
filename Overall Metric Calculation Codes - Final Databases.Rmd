@@ -1,0 +1,3320 @@
+---
+title: "Metric Calculation Notebook 2023"
+
+---
+
+#Initialize libraries and directory
+```{r SETUP: Initializing Libraries, message=FALSE, warning=FALSE}
+#Initialize libraries and directory
+
+library(tidyverse)
+library(dplyr)
+library(vroom)
+library(peakRAM)
+library(data.table)
+library(readr)
+library(pryr)
+library(R2DT)
+library(parallel)
+library(beepr)
+library(pillar)
+library(ellipsis)
+library(rlang)
+
+setwd("~")
+
+finish <- function(n = 3) {
+  for(i in 1:n){
+    beep(1)
+    Sys.sleep(0.5)
+  }
+  beep(5)
+}
+
+my.colors <- function(input, quantile = 0, tr = 0.45) {
+  if(input == 'blue') {return(rgb(27/255,57/255,255/255,tr))}
+  if(input == 'orange') {return(rgb(252/255,150/255,17/255,tr))}
+  if(input == 'gray') {return(rgb(126/255,126/255,126/255,tr))}
+  if(input == 'magenta') {return(rgb(227/255,74/255,217/255,tr))}
+  if(input == 'quantile') {
+    quantiles <- c(rgb(255/255,1/255,0/255,tr),
+                   rgb(255/255,55/255,10/255,tr),
+                   rgb(255/255,108/255,20/255,tr),
+                   rgb(255/255,162/255,31/255,tr),
+                   rgb(255/255,215/255,41/255,tr),
+                   rgb(236/255,249/255,50/255,tr),
+                   rgb(189/255,250/255,59/255,tr),
+                   rgb(142/255,252/255,68/255,tr),
+                   rgb(94/255,253/255,76/255,tr),
+                   rgb(47/255,255/255,85/255,tr))
+    return(quantiles[quantile])
+  }
+}
+
+options(scipen = 999)
+```
+
+
+```{r LOAD: Base Data, message=FALSE, warning=FALSE}
+#Load the data
+data <- fread("~/Grid_Square_Metrics_2x2.csv")
+
+#Rename certain columns so they are cleaner
+setnames(data,c("id","capacity_f","wind_spe_1","landfall_d","longitude","latitude","VES_meamax","ML_sp","ML_shannon","bin_lat","bin_lon"),c("ID","Cap_factor","Windspeed","Land_dist_trans","Longitude","Latitude","Vessels","Marine_life_SR","Marine_life_shannon","Bin_lat","Bin_lon"))
+
+
+```
+
+#With Turbine Choice
+```{r FUNCTIONS and EXECUTE: Turbine Data Tables and Calculate Visibility}
+#Initial functions and information to calculate the grid square metrics
+
+##Turbine Codes
+#T5.df = 5 MW turbine sight height = 90 + 63 = 153m
+#T8.df = 8 MW turbine sight height = 110 + 82 = 192m
+#T10.df = 10 MW turbine sight height = 119 + 89 = 208m
+#T15.df = 15 MW turbine sight height = 150 + 120 = 270m
+
+#How far off shore is the turbine visible. Returns one value for a given turbine
+Visible <- function(T.height, V.height = 2) { #all inputs in meters
+  R.Earth <- 6371 #km
+  D1 <- sqrt(R.Earth^2-(R.Earth - V.height/1000)^2)
+  D2 <- sqrt(R.Earth^2-(R.Earth - T.height/1000)^2)
+  return(D1+D2) #in kilometers
+}
+
+visible.5 <- Visible(153) #49.2 km
+visible.8 <- Visible(192) #54.5 km
+visible.10 <- Visible(215) #57.3 km
+visible.15 <- Visible(267) #63.7 km
+
+#names of the needed columns from the full dataset
+col.names <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","Depth_mean","Depth_vari","Shore_ID","Shore_dist","Cab_len","MPA","FEH_mean","FEH_max","POI_ID","POI_dist","POI23_ID","POI23_dist","Port_ID","Port_dist","Cap_factor","Windspeed","Land_dist_trans","Vessels","Marine_life_SR","Marine_life_shannon")  
+
+#### Split into dataframes for the different turbine sizes
+T5.dt = copy(data[ , ..col.names])
+T8.dt = copy(data[ , ..col.names])
+T10.dt = copy(data[ , ..col.names])
+T15.dt = copy(data[ , ..col.names])
+  
+## Add visible based on turbine size
+T5.dt[ , visible := ifelse(Shore_dist <= visible.5, 1, 0)]
+T8.dt[ , visible := ifelse(Shore_dist <= visible.8, 1, 0)]
+T10.dt[ , visible := ifelse(Shore_dist <= visible.10, 1, 0)]
+T15.dt[ , visible := ifelse(Shore_dist <= visible.15, 1, 0)]
+
+#depth limit for moored and fixed foundation technologies
+moored.lim <- 1500 #meters. This is greater than the actual depth limit. this should be a technical limit
+fixed.lim <- 100 #meters. This is greater than the actual depth limit. this hsould be a technical limit
+
+#Function to check water depth x substructure interaction term.
+Depth.Int <- function(DT, fixed.lim = 100, moored.lim = 1500) { #dataframes are the input. Make sure this is done in data.table style
+  DT[ , depxfixed := ifelse(-Depth_mean <= fixed.lim, 1, 0)]
+  DT[ , depxmoored := ifelse(-Depth_mean <= moored.lim, 1, 0)]
+  return(DT)
+}
+
+#Add depth interaction terms for depth x substructure type
+T5.dt <- Depth.Int(T5.dt)
+T8.dt <- Depth.Int(T8.dt)
+T10.dt <- Depth.Int(T10.dt)
+T15.dt <- Depth.Int(T15.dt)
+
+#Add cable interaction terms for cable x substructure type
+
+T5.dt[ ,':='(cabxfixed = ifelse(Cab_len != 0, 0, 1),
+             cabxmoored = ifelse(Cab_len != 0, 0, 1))] 
+T8.dt[ ,':='(cabxfixed = ifelse(Cab_len != 0, 0, 1),
+             cabxmoored = ifelse(Cab_len != 0, 0, 1))]  
+T10.dt[ ,':='(cabxfixed = ifelse(Cab_len != 0, 0, 1),
+             cabxmoored = ifelse(Cab_len != 0, 0, 1))] 
+T15.dt[ ,':='(cabxfixed = ifelse(Cab_len != 0, 0, 1),
+             cabxmoored = ifelse(Cab_len != 0, 0, 1))]
+```
+
+
+```{r FUNCTIONS and EXECUTE: Mooring Cable Functions}
+###Moorings length estimates. equation from Huang et al. (2021)
+Submerged <- function(depth, max.force, w = 0.1) { #depth in m, force in tons, w in tons/m
+  length <- depth*sqrt(((2*max.force)/(w*depth))+1) #length of chains in submerged water
+  # dist <- ((max.force/w)-depth)*log((length + (max.force/w))/((max.force/w)-depth)) #Maximum horizontal distance from fairlead to the anchor
+  dist <- (max.force/w)*acosh(((w*depth)/max.force) + 1)
+  return(length) #in m. Length of one chain. length should be greater than distance
+}
+V.Submerged <- Vectorize(Submerged)
+
+Fairlead.force <- function(force, angle = 0) {#force in kN, angle comes from that used in 15 MW turbine design (Gaertner or Allen)
+  eff.force <- force/cos(angle) #angle of zero gives the horizontal force.
+  force.ton <- eff.force*0.1
+  return(force.ton) #returns value in tons
+}
+
+n.chains <- 3
+fs <- 1
+
+#load DLC results
+DLC1.3_15 <- read.csv("~/Turbine Force Curve Results/DLC1.3_15.csv")
+DLC1.3_10 <- read.csv("~/Turbine Force Curve Results/DLC1.3_10.csv")
+DLC1.3_8 <- read.csv("~/Turbine Force Curve Results/DLC1.3_8.csv")
+DLC1.3_5 <- read.csv("~/Turbine Force Curve Results/DLC1.3_5.csv")
+
+#maximum forces (in kN) for each turbine felt in the Fairlead
+fairlead.15 <- Fairlead.force(max(DLC1.3_15))*fs
+fairlead.10 <- Fairlead.force(max(DLC1.3_10))*fs
+fairlead.8 <- Fairlead.force(max(DLC1.3_8))*fs
+fairlead.5 <- Fairlead.force(max(DLC1.3_5))*fs
+
+T5.dt[ , ':='(moorings.low = -Depth_mean*(-Depth_mean <= moored.lim),
+              moorings.high = V.Submerged(depth = -Depth_mean, max.force = fairlead.5)*(-Depth_mean <= moored.lim))] #taut moorings are straight down. This will be likely in higher depths
+
+T8.dt[ , ':='(moorings.low = -Depth_mean*(-Depth_mean <= moored.lim),
+              moorings.high = V.Submerged(depth = -Depth_mean, max.force = fairlead.8)*(-Depth_mean <= moored.lim))]
+
+T10.dt[ , ':='(moorings.low = -Depth_mean*(-Depth_mean <= moored.lim),
+               moorings.high = V.Submerged(depth = -Depth_mean, max.force = fairlead.10)*(-Depth_mean <= moored.lim))]
+
+T15.dt[ , ':='(moorings.low = -Depth_mean*(-Depth_mean <= moored.lim),
+               moorings.high = V.Submerged(depth = -Depth_mean, max.force = fairlead.15)*(-Depth_mean <= moored.lim))]
+
+#Note: the placement of the three anchors is not defined. Without this placement, #I can't describe the area that the turbine can be in, and thus, 
+#the area of the seabed that is disturbed. 
+
+#### Add column for disturbed seabed from moorings
+T5.dt[ ,seabed.moorings := moorings.high - moorings.low] #maximum length of 
+T8.dt[ ,seabed.moorings := moorings.high - moorings.low]
+T10.dt[ ,seabed.moorings := moorings.high - moorings.low]
+T15.dt[ ,seabed.moorings := moorings.high - moorings.low]
+
+#Area of disturbed seabed from moorings. per turbine with 3 mooring chains. Measurement idea came from Pan et al. (2018)
+angle <- 60 #degrees
+n.ch <- 3 #number of chains
+circle.prop <- (angle*n.ch)/360 #proportion of area of circle that comprises the disturbed seabed
+T5.dt[ , seabed.moorings.area := circle.prop*pi*seabed.moorings^2] #in m^2
+T8.dt[ , seabed.moorings.area := circle.prop*pi*seabed.moorings^2]
+T10.dt[ , seabed.moorings.area := circle.prop*pi*seabed.moorings^2]
+T15.dt[ , seabed.moorings.area := circle.prop*pi*seabed.moorings^2]
+
+### Add column for disturbed seabed from scour protection and monopile foundations
+
+d.scour <- 50 #in meters. from ICF, 2020
+
+T5.dt[, seabed.monopile := (pi*(d.scour/2)^2)*(-Depth_mean <= fixed.lim)] 
+T8.dt[, seabed.monopile := (pi*(d.scour/2)^2)*(-Depth_mean <= fixed.lim)] 
+T10.dt[, seabed.monopile := (pi*(d.scour/2)^2)*(-Depth_mean <= fixed.lim)] 
+T15.dt[, seabed.monopile := (pi*(d.scour/2)^2)*(-Depth_mean <= fixed.lim)] 
+
+#### Add column for volume of fixed infrastructure in the water column (fixed foundations)
+
+#tower base diameters for the turbines. in meters. Sources are from the reference turbine sources
+diam.5 <- 6
+diam.8 <- 7.7
+diam.10 <- 8.3
+diam.15 <- 10
+
+T5.dt[ , fixed.foundation := (-Depth_mean*pi*(diam.5/2)^2)*(-Depth_mean <= fixed.lim)] #in m^3
+
+T8.dt[ , fixed.foundation := (-Depth_mean*pi*(diam.8/2)^2)*(-Depth_mean <= fixed.lim)] 
+
+T10.dt[ , fixed.foundation := (-Depth_mean*pi*(diam.10/2)^2)*(-Depth_mean <= fixed.lim)]
+
+T15.dt[ , fixed.foundation := (-Depth_mean*pi*(diam.15/2)^2)*(-Depth_mean <= fixed.lim)]
+
+###Semisub submerged volume
+draft <- 20 #meters
+f.diam <- 12.5 #meters
+c.diam <- 10 #meters
+submerged.volume <- (draft*3*pi*(f.diam/2)^2) + (draft*pi*(c.diam/2)^2) #8933.9 m^3
+
+T5.dt[ , semisub.volume := submerged.volume] #in m^2
+T8.dt[ , semisub.volume := submerged.volume]
+T10.dt[ , semisub.volume := submerged.volume]
+T15.dt[ , semisub.volume := submerged.volume]
+```
+
+```{r FUNCTIONS: Turbine-Substructure-Station Keeping Cost Functions}
+#Turbines. Vars: kW of plant
+T.unit.cost <- 1300*1000 #USD/MW. #Source: Beiter, P., Musial, W., Duffy, P., Cooperman, A., Shields, M., Heimiller, D., & Optis, M. (2020). The Cost of Floating Offshore Wind Energy in California Between 2019 and 2032 (Issue November). https://doi.org/NREL/TP-5000-77384
+
+T.cost <- function(turbine.size) return(T.unit.cost*turbine.size) #returns single turbine cost in USD 
+
+#Substructures. Vars: number of turbines, depth
+#refer to Myhr et al., 2014 for these assumptions.
+#Monopiles (fixed)
+monopile.steel.needed <- 1200/30 #in tons/m of water depth. ?What about the different turbine sizes?
+steel.cost <- 1000 #USD/ton
+
+Fixed.sub.cost <- function(depth) {
+  monopile.mat.cost <- monopile.steel.needed*depth*steel.cost #returns single substructure cost in USD
+  monopile.man.cost <- monopile.mat.cost*1 #Source considers a 100% fabrication cost
+  return(monopile.mat.cost + monopile.man.cost) #returns single substructure cost in USD/monopile
+}
+
+Install.mono.cost <- 1.538 #in MUSD/monopile
+
+#Semi-submersibles (floating)
+semisub.steel.needed <- 3900 #in tons per substructure.
+
+Floating.sub.cost <- function() { #does not depend on anything. Fixed cost per turbine.
+  semisub.mat.cost <- semisub.steel.needed*steel.cost #in USD/substructure
+  semisub.man.cost <- semisub.mat.cost*2 #Source considers a 200% 'manufacturing complexity factor'
+  return(semisub.man.cost + semisub.mat.cost) #in USD/semisub
+}
+
+Install.semisub.cost <- 0
+
+#Mooring Chain cost. Vars: length of chains
+breaking.load <- 4535 #in kN. For an R3 studless chain with weight = 0.1 t/m from Daihan (http://www.dhac.co.kr/m32.php?pn=3&sn=2&sn2=1)
+
+Moorings.cost <- function(length) {
+  Cost <- ((0.0591*breaking.load-87.6)*length)+(10.198*breaking.load)
+  if(length <= 0) Cost <- 0 #if length is zero then there is no mooring chain
+  return(Cost)
+}
+
+V.Moorings.cost <- Vectorize(Moorings.cost)
+
+#DP System Cost. in MUSD per turbine. Source = Kongsberg
+Htype.thruster <- 1.77 #cost per F-type thruster in MUSD
+DP.cost <- function(n, thruster.unit.cost = Htype.thruster) return(n*thruster.unit.cost) #give unit cost in MUSD. Returns MUSD/turbine DP system
+```
+
+
+```{r EXECUTE: Add Turbine-Substructure-Station Keeping Cost Variables}
+### Costs per Turbine in the plant
+#Turbine Cost. in MUSD per turbine
+T5.dt[ , cost.turbine := T.cost(5)/1000000]
+T8.dt[ , cost.turbine := T.cost(8)/1000000]
+T10.dt[ , cost.turbine := T.cost(10)/1000000]
+T15.dt[ , cost.turbine := T.cost(15)/1000000]
+
+#Monopile Cost. in MUSD per turbine. returns NA if its too deep
+T5.dt[ , cost.monopile := ifelse(-Depth_mean <= fixed.lim, Fixed.sub.cost(-Depth_mean)/1000000, NA)] 
+T8.dt[ , cost.monopile := ifelse(-Depth_mean <= fixed.lim, Fixed.sub.cost(-Depth_mean)/1000000, NA)]
+T10.dt[ , cost.monopile := ifelse(-Depth_mean <= fixed.lim, Fixed.sub.cost(-Depth_mean)/1000000, NA)]
+T15.dt[ , cost.monopile := ifelse(-Depth_mean <= fixed.lim, Fixed.sub.cost(-Depth_mean)/1000000, NA)]
+
+#Semisubmersible floating substructure costs. in MUSD per turbine
+T5.dt[ , cost.semisub := Floating.sub.cost()/1000000]
+T8.dt[ , cost.semisub := Floating.sub.cost()/1000000]
+T10.dt[ , cost.semisub := Floating.sub.cost()/1000000]
+T15.dt[ , cost.semisub := Floating.sub.cost()/1000000]
+
+
+#Mooring Chain costs. in MUSD per turbine. Returns NA if its too deep
+T5.dt[ , cost.mooring := ifelse(-Depth_mean <= moored.lim, n.chains*V.Moorings.cost(moorings.high)/1000000, NA)]
+T8.dt[ , cost.mooring := ifelse(-Depth_mean <= moored.lim, n.chains*V.Moorings.cost(moorings.high)/1000000, NA)]
+T10.dt[ , cost.mooring := ifelse(-Depth_mean <= moored.lim, n.chains*V.Moorings.cost(moorings.high)/1000000, NA)]
+T15.dt[ , cost.mooring := ifelse(-Depth_mean <= moored.lim, n.chains*V.Moorings.cost(moorings.high)/1000000, NA)]
+
+#DP system costs. Considers the LCOE minimizing configuration from Santarromana et al. (2023) in Wind Speed Class 08
+T5.dt[ , cost.DP := DP.cost(n = 4)] #in MUSD/turbine
+T8.dt[ , cost.DP := DP.cost(n = 4)] 
+T10.dt[ , cost.DP := DP.cost(n = 5)] 
+T15.dt[ , cost.DP := DP.cost(n = 13)] 
+
+```
+
+
+```{r EXECUTE: Onshore Cable Cost Function and Metrics}
+#Onshore cable to transmission or POI. Vars: dist from landfall to transmission or POI (in km)
+onshore.per.mile <- 2 #MUSD/mile-Plant (Source: Saadi et al., 2018)
+Onshore.cost <- function(dist.km) return((dist.km/1.6)*onshore.per.mile) #returns value in MUSD/PLANT
+
+#Onshore Transmission line from landfall to POI. in MUSD/Plant
+T5.dt[ , Plant.cost.onshorecable := Onshore.cost(Land_dist_trans)] #in MUSD/plant
+T8.dt[ , Plant.cost.onshorecable := Onshore.cost(Land_dist_trans)]
+T10.dt[ , Plant.cost.onshorecable := Onshore.cost(Land_dist_trans)]
+T15.dt[ , Plant.cost.onshorecable := Onshore.cost(Land_dist_trans)]
+
+```
+
+
+```{r FUNCTIONS and EXECUTE: InterArray Cable Cost Functions and Metrics}
+#InterArray Cable Cost. Vars: number of turbines, water depth, floating or fixed turbines needed
+#####Source: Jung et al. (2018). CHECK IF Myhr et al. (2014) is better. Check ORBIT
+IA.unit.cost <- 45000 #USD/km of cable
+IA.unit.install.cost <- 400000 #USD/km distance b/w turbines
+d.turb <- 2 #in km. distance to adjacent turbine.
+
+#below returns values in MUSD per turbine
+IA.cost.floating <- function() return(((IA.unit.cost*(d.turb + 0.2))+(d.turb*IA.unit.install.cost))/1000000) #assume they sag to 100m below the water surface with buoys
+IA.cost.fixed <- function(depth) return(((IA.unit.cost*(d.turb + 2*depth))+(d.turb*IA.unit.install.cost))/1000000) #the cables must go down to the seafloor and are buried.
+
+#Inter Array Cable Cost. in MUSD
+#fixed is the baseline technology in which IA cables are buried
+#floating is the more nascent technology in which IA cables are floated beneath the water surface.
+T5.dt[ , ':='(cost.IA.fixed = IA.cost.fixed(-Depth_mean),
+              cost.IA.floating = IA.cost.floating())] 
+T8.dt[ , ':='(cost.IA.fixed = IA.cost.fixed(-Depth_mean),
+              cost.IA.floating = IA.cost.floating())]
+T10.dt[ , ':='(cost.IA.fixed = IA.cost.fixed(-Depth_mean),
+              cost.IA.floating = IA.cost.floating())]
+T15.dt[ , ':='(cost.IA.fixed = IA.cost.fixed(-Depth_mean),
+              cost.IA.floating = IA.cost.floating())]
+```
+
+
+```{r FUNCTIONS and EXECUTE: Turbine Gross Energy Production Functions and Metrics}
+
+### Linear model for the energy consumption of the DP system. Vars: mean wind speed, turbine size
+mean.windspeeds <- c(7.05, 8.86, 9.59) #in m/s. correspond to Wind Speed Class 14, PT, and 08 respectively
+A.TCP <- c(0.392,0.315,0.295) #in %. 5 MW turbine TCP for the 9F configuration corresponding to each windspeed
+B.TCP <- c(0.298,0.232,0.214)
+C.TCP <- c(0.378,0.317,0.297)
+D.TCP <- c(0.724,0.637,0.61)
+
+A.mod <- lm(A.TCP ~ mean.windspeeds)
+B.mod <- lm(B.TCP ~ mean.windspeeds)
+C.mod <- lm(C.TCP ~ mean.windspeeds)
+D.mod <- lm(D.TCP ~ mean.windspeeds)
+
+#plot to show the linear models
+plot(mean.windspeeds, A.TCP*100,pch=19, col = my.colors('blue',tr = 1), 
+     xlim = c(0,15), ylim = c(0,100), las = 1,
+     xlab = "Mean Windspeed [m/s]", ylab = "Thruster Consumption Percent [%]")
+abline(A.mod$coefficients[1]*100,A.mod$coefficients[2]*100, col = my.colors('blue',tr = 1),lty = 2, lwd = 1)
+points(mean.windspeeds, B.TCP*100,pch =19, col = my.colors('orange',tr = 1))
+abline(B.mod$coefficients[1]*100,B.mod$coefficients[2]*100, col = my.colors('orange',tr = 1),lty = 2, lwd = 1)
+points(mean.windspeeds, C.TCP*100,pch =19, col = my.colors('gray',tr = 1))
+abline(C.mod$coefficients[1]*100,C.mod$coefficients[2]*100, col = my.colors('gray',tr = 1),lty = 2, lwd = 1)
+points(mean.windspeeds, D.TCP*100,pch =19, col = my.colors('magenta',tr = 1))
+abline(D.mod$coefficients[1]*100,D.mod$coefficients[2]*100, col = my.colors('magenta',tr = 1),lty = 2, lwd = 1)
+legend('topright', legend = c("5MW Turbine","8MW Turbine","10MW Turbine","15MW Turbine"),
+       lty = 2, pch = 19,col = c(my.colors('blue',tr=1),my.colors('orange',tr=1),my.colors('gray',tr=1),my.colors('magenta',tr=1)))
+
+#Functions to estimate the TCP of DP for turbines under different mean wind speeds
+TCP.5 <- function(windspeed) return(as.numeric(predict(A.mod,newdata = data.frame(mean.windspeeds = windspeed))))
+TCP.8 <- function(windspeed) return(as.numeric(predict(B.mod,newdata = data.frame(mean.windspeeds = windspeed))))
+TCP.10 <- function(windspeed) return(as.numeric(predict(C.mod,newdata = data.frame(mean.windspeeds = windspeed))))
+TCP.15 <- function(windspeed) return(as.numeric(predict(D.mod,newdata = data.frame(mean.windspeeds = windspeed))))
+
+#Annual electricity production at Turbine. in MWh/turbine-year
+#DP. Energy Total Consumption Percent comes from Energy Module.R
+T5.dt[ , ':='(NRG.turbine.year = Cap_factor*8760*5,
+              NRG.turbine.year.DP = Cap_factor*8760*5*(1-TCP.5(Windspeed)))]
+T8.dt[ , ':='(NRG.turbine.year = Cap_factor*8760*8,
+              NRG.turbine.year.DP = Cap_factor*8760*8*(1-TCP.8(Windspeed)))]
+T10.dt[ , ':='(NRG.turbine.year = Cap_factor*8760*10,
+              NRG.turbine.year.DP = Cap_factor*8760*10*(1-TCP.10(Windspeed)))]
+T15.dt[ , ':='(NRG.turbine.year = Cap_factor*8760*15,
+              NRG.turbine.year.DP = Cap_factor*8760*15*(1-TCP.15(Windspeed)))]
+
+```
+
+#With Turbine and Plant Size Choices
+```{r COPY: Plant Size Data Tables}
+#Plant sizes are: 200, 400, 600, 800, 1000, 1200, 1400
+
+T5.200.dt = copy(T5.dt) 
+T5.400.dt = copy(T5.dt)
+T5.600.dt = copy(T5.dt)
+T5.800.dt = copy(T5.dt)
+T5.1000.dt = copy(T5.dt)
+T5.1200.dt = copy(T5.dt)
+T5.1400.dt = copy(T5.dt)
+
+T8.200.dt = copy(T8.dt)
+T8.400.dt = copy(T8.dt)
+T8.600.dt = copy(T8.dt)
+T8.800.dt = copy(T8.dt)
+T8.1000.dt = copy(T8.dt)
+T8.1200.dt = copy(T8.dt)
+T8.1400.dt = copy(T8.dt)
+
+T10.200.dt = copy(T10.dt)
+T10.400.dt = copy(T10.dt)
+T10.600.dt = copy(T10.dt)
+T10.800.dt = copy(T10.dt)
+T10.1000.dt = copy(T10.dt)
+T10.1200.dt = copy(T10.dt)
+T10.1400.dt = copy(T10.dt)
+
+T15.200.dt = copy(T15.dt)
+T15.400.dt = copy(T15.dt)
+T15.600.dt = copy(T15.dt)
+T15.800.dt = copy(T15.dt)
+T15.1000.dt = copy(T15.dt)
+T15.1200.dt = copy(T15.dt)
+T15.1400.dt = copy(T15.dt)
+
+```
+
+
+```{r FUNCTIONS: Export Cable Functions - HVDC}
+###HVDC Calculations. from Xiang et al. (2021)
+HVDC.Cables <- read.csv("~/HVDC_Cable_Data.csv")
+
+HVDC.Cables <- HVDC.Cables %>%
+  rename(Voltage.kV = ï..Voltage.kV) %>%
+  mutate(Circ.Capability.MW = 4*Voltage.kV*Current.A/1000) #a circuit will have two lines. CHECK THIS
+HVDC.Cables <- setDT(HVDC.Cables)
+
+#Assumptions 
+GBP.USD <- 1.23 #USD/GBP
+f_t <- 0.2 #Cost factor of transformer number or converter number per platform
+pf <- 1 #power factor
+Fix.HVDC <- 25000000*GBP.USD #USD. Base/fixed terminal cost
+Var.HVDC <- 109000*GBP.USD #USD/MVA. variable terminal cost
+eta.off.c <- 0.9828 #Offshore HVDC Converter efficiency
+
+Cable.Cost <- function(unit.cost, length, num) { #GBP/km,km,n
+  Cost <- unit.cost*length*num*GBP.USD #USD
+  return(Cost/1000000) #MUSD
+}
+HVDC.Terminal.Cost <- function(S_MVA, num, Fix = Fix.HVDC, Var = Var.HVDC) {
+  offshore.SS.cost <- Fix + (1 + f_t * (num-2))*Var*S_MVA #in USD
+  onshore.SS.cost <- 0.08148*(S_MVA)*1000000*GBP.USD #in USD
+  Terminal.Cost <- offshore.SS.cost + onshore.SS.cost
+  return(Terminal.Cost/1000000) #returns value in MUSD
+  
+}
+
+#end-to-end efficiency
+HVDC.Eff <- function(l_c, S_MVA, V_cn, r_c, n_c) { #km,MVA,kV,Ohm/km,num parallel circuits
+  A <- (S_MVA*pf*eta.off.c)/V_cn^2
+  B <- (r_c * l_c)/(2*n_c)
+  eta.transmission <- 1 - (A*B)
+  return(eta.transmission) #returns a ratio value
+}
+
+#note spacing comes from US DOI - Bureau of Safety and Environmental Enforcement. (2014). Offshore Wind Submarine Cable Spacing Guidance.
+HVDC.System <- function(plant.MW, dist.km, spacing = 0.06, w.cost = 1, w.eta = 0, w.area = 0) {
+  HVDC.dt = copy(HVDC.Cables) #Create a copy of the base Cables Data
+  
+  HVDC.dt[ , N.Sets := ceiling(plant.MW/Circ.Capability.MW)]
+  HVDC.dt[ , Cable.Cost.MUSD := mapply(Cable.Cost,unit.cost = .(Cost.GBPkm), dist.km, num = .(N.Sets*2))]
+  HVDC.dt[ , Terminal.Cost.MUSD := mapply(HVDC.Terminal.Cost, S_MVA=plant.MW, num = .(N.Sets))]
+  HVDC.dt[ , Total.Cost.MUSD := Cable.Cost.MUSD + Terminal.Cost.MUSD]
+  HVDC.dt[ , Eta := mapply(HVDC.Eff, dist.km, plant.MW, .(Voltage.kV),.(Resistance.Ohkm),.(N.Sets))]
+  HVDC.dt[ , Area.km2 := dist.km*(N.Sets+1)*spacing] #area of seabed buffer needed
+  HVDC.dt[ , Total.Cost.NORM := ifelse(sum(!is.na(Total.Cost.MUSD))>0, Total.Cost.MUSD/max(Total.Cost.MUSD, na.rm = TRUE),NA)]
+  HVDC.dt[ , Eta.NORM := ifelse(sum(!is.na(Eta))>0,Eta/max(Eta, na.rm = TRUE),NA)]
+  HVDC.dt[ , Area.NORM := ifelse(sum(!is.na(Area.km2))>0,Area.km2/max(Area.km2, na.rm = TRUE),NA)]
+  HVDC.dt[ , SCORE := w.cost*(1-Total.Cost.NORM) + w.eta*Eta.NORM + w.area*(1-Area.NORM)]
+
+  HVDC.dt <- HVDC.dt[order(-SCORE)]
+
+  return(HVDC.dt[1,]) #returns an ordered dataframe, so the best option is the first
+}
+
+#### Function to add HV Cable metrics
+Add.HV.System.Metrics <- function(DT, plant.size.MW, w.cost = 0.5,w.eta = 0.5, w.area = 0) { #takes the data table as an input
+
+  #Calculate HVDC Metrics for best outcome
+  HVDC.OUTPUT <- as.data.table(t(mapply(FUN = HVDC.System, dist.km = DT$Shore_dist ,plant.MW = plant.size.MW, w.cost, w.eta, w.area)))
+
+  HVDC.OUTPUT <- setDT(HVDC.OUTPUT)
+
+  DT[ , ':=' (Plant.seabed.cable.DC = unlist(HVDC.OUTPUT[ , "Area.km2"]),
+              Plant.cost.export.DC = unlist(HVDC.OUTPUT[ , "Total.Cost.MUSD"]),
+              Plant.efficiency.DC = unlist(HVDC.OUTPUT[ , "Eta"]))]
+
+  rm(HVDC.OUTPUT) #Clean up some memory
+
+  return(DT)
+}
+```
+
+
+```{r FUNCTIONS: Export Cable Functions with Parallel Computing}
+Add.HV.System.Metrics.apply <- function(row.ID, Main.DT, plant.size.MW, w.cost = 1,w.eta = 0, w.area = 0) { #takes one row of the data.table as an input
+
+  Out.DT <- Main.DT[ID == row.ID, ] #selects the one row of the data.table
+  
+  #Calculate HVDC Metrics for best outcome
+  HVDC.OUTPUT <- as.data.table(t(mapply(FUN = HVDC.System, dist.km = Out.DT$Shore_dist ,plant.MW = plant.size.MW, w.cost, w.eta, w.area)))
+
+  HVDC.OUTPUT <- setDT(HVDC.OUTPUT)
+
+  Out.DT[ , ':=' (Plant.seabed.cable.DC = unlist(HVDC.OUTPUT[ , "Area.km2"]),
+                  Plant.cost.export.DC = unlist(HVDC.OUTPUT[ , "Total.Cost.MUSD"]),
+                  Plant.efficiency.DC = unlist(HVDC.OUTPUT[ , "Eta"]))]
+
+  rm(HVDC.OUTPUT) #Clean up some memory
+
+  return(Out.DT) #returns a 1-row data.table
+}
+
+#Running the above in parallel
+Parallel.HV.System <- function(DT, DT.NAME, PLANT.MW) { #data.table, #character, integer, integer
+
+  DT.IDs <- DT[ ,"ID"] #gets all the IDs in the datatable
+  DT.IDs <- unlist(DT.IDs, use.names = FALSE) #turns named list into a simple vector
+  DT.IDs <- as.integer(DT.IDs) #converts into an integer which is smaller
+  numCores <- detectCores() - 2 #8 processors, run on 6 of them to not crash
+  
+  cl <- makeCluster(numCores)
+  
+  clusterEvalQ(cl, {
+    library(data.table)
+    library(dplyr)
+    })
+
+  clusterExport(cl, c(DT.NAME,"HVDC.Cables","HVDC.System","HVDC.Eff","HVDC.Terminal.Cost",
+                      "Cable.Cost","GBP.USD","Fix.HVDC","Var.HVDC",
+                      "eta.off.c","f_t","pf"))
+
+  #This is where the parallel run occurs
+  RESULT <- parLapply(cl, DT.IDs, Add.HV.System.Metrics.apply, Main.DT = DT, plant.size.MW = PLANT.MW)
+                          
+  RESULT.DT <- rbindlist(RESULT)
+
+  stopCluster(cl)
+  
+  # Joined.dt <- merge(DT, RESULT.DT, by = "ID", all = TRUE)
+  
+  return(RESULT.DT)
+}
+```
+
+```{r EXECUTE: Add Export Cable Metrics - Only differentiated by plant size}
+#This block takes a long time. ~7hrs to execute this block. 
+
+T5.200.dt <- Parallel.HV.System(T5.200.dt,"T5.200.dt",200) #~60 minutes to run each
+T5.400.dt <- Parallel.HV.System(T5.400.dt,"T5.400.dt",400)
+T5.600.dt <- Parallel.HV.System(T5.600.dt,"T5.600.dt",600)
+T5.800.dt <- Parallel.HV.System(T5.800.dt,"T5.800.dt",800)
+T5.1000.dt <- Parallel.HV.System(T5.1000.dt,"T5.1000.dt",1000)
+T5.1200.dt <- Parallel.HV.System(T5.1200.dt,"T5.1200.dt",1200)
+T5.1400.dt <- Parallel.HV.System(T5.1400.dt,"T5.1400.dt",1400)
+
+```
+
+
+```{r VALIDATE: Model Techno-Economic Comparison with NREL Model}
+T10.1000.scrap <- copy(T10.1000.dt) 
+
+Lease.Areas <- read.csv("~/BOEM Lease Area IDs.csv") %>%
+  rename(Humboldt = ï..Humboldt)
+
+Humboldt.IDs <- Lease.Areas$Humboldt[!is.na(Lease.Areas$Humboldt)]
+Morro.IDs <- Lease.Areas$Morro.Bay[!is.na(Lease.Areas$Morro.Bay)]
+Diablo.IDs <- Lease.Areas$Diablo.Canyon[!is.na(Lease.Areas$Diablo.Canyon)]
+Capewind.IDs <- Lease.Areas$Cape.Wind[!is.na(Lease.Areas$Cape.Wind)]
+
+Diablo <- T10.1000.scrap[ID %in% Diablo.IDs, .(mean_Turbine = mean(Plant.cost.turbine, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                               mean_Substructure = mean(Plant.cost.semisub, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                               mean_IA.fixed = mean(Plant.cost.IA.fixed, na.rm = TRUE),
+                                               mean_IA.floating = mean(Plant.cost.IA.floating, na.rm = TRUE),
+                                               mean_onshore = mean(Plant.cost.onshorecable, na.rm = TRUE),
+                                               mean_HVAC = mean(Plant.cost.export.AC, na.rm = TRUE),
+                                               mean_HVDC = mean(Plant.cost.export.DC, na.rm = TRUE))]
+
+Morro <- T10.1000.scrap[ID %in% Morro.IDs, .(mean_Turbine = mean(Plant.cost.turbine, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                             mean_Substructure = mean(Plant.cost.semisub, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                             mean_IA.fixed = mean(Plant.cost.IA.fixed, na.rm = TRUE),
+                                             mean_IA.floating = mean(Plant.cost.IA.floating, na.rm = TRUE),
+                                             mean_onshore = mean(Plant.cost.onshorecable, na.rm = TRUE),
+                                             mean_HVAC = mean(Plant.cost.export.AC, na.rm = TRUE),
+                                             mean_HVDC = mean(Plant.cost.export.DC, na.rm = TRUE))]
+
+Humboldt <- T10.1000.scrap[ID %in% Humboldt.IDs, .(mean_Turbine = mean(Plant.cost.turbine, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                                   mean_Substructure = mean(Plant.cost.semisub, na.rm = TRUE), #in MUSD/Plant & USD/kW
+                                                   mean_IA.fixed = mean(Plant.cost.IA.fixed, na.rm = TRUE),
+                                                   mean_IA.floating = mean(Plant.cost.IA.floating, na.rm = TRUE),
+                                                   mean_onshore = mean(Plant.cost.onshorecable, na.rm = TRUE),
+                                                   mean_HVAC = mean(Plant.cost.export.AC, na.rm = TRUE),
+                                                   mean_HVDC = mean(Plant.cost.export.DC, na.rm = TRUE))]
+
+#inputs in 20230317 Model Techno-Economic Comparison.xlsx
+```
+
+
+```{r FUNCTIONS: Alternative Value Chain}
+# #Offshore Transformer Cost. Is it required for an electrolyzer?
+#Vars: kW of plant
+TR.unit.cost <- 1300*1000 #USD/MW. From Xiang et al. (2016)
+TR.platform <- 6710000 #USD/platform
+n.platforms <- 1
+
+Transformer.cost <- function(plant.size) return((TR.platform*n.platforms)+(TR.unit.cost*plant.size)) #give plant size in MW, returns value in USD
+
+#Electrolyzer Cost. Vars: kW of plant
+EL.unit.cost <- 900*1000 #USD/MW. Saba et al. (2018)
+EL.platform <- 6710000 #USD/platform. Same as the Transformer platform. SENSITIVITY ANALYSIS
+n.platforms <- 1
+#give plant size in MW
+Electrolyzer.cost <- function(plant.size) return((EL.platform*n.platforms)+(EL.unit.cost*plant.size))
+
+H2.gen <- function(electricity.MWh, kWh.kgh2 = 67) { #annual input of electricity in MWh. Source: IRENA, 2020 (Green Hydrogen cost reduction)
+  # prod.rate <- 42 #kWh/kgH2. This is the optimistic case. Pessimistic = 73
+  H2.output <- ((electricity.MWh*1000)/kWh.kgh2)/1000 #gives tH2
+  return(H2.output) #in tH2
+}
+
+#from Popov & Baldynov (2019)
+Loss.H2 <- function(dist.km, liquefaction = 0.15,loss.per.day = 0.0002, ship.speed = 35, fudge = 1.05) {
+  eff.liq <- 1-liquefaction
+  time.in.storage <- 2*dist.km/ship.speed/24 #in days. also includes storage during transport, and waiting while the ship returns from shore
+  eff.storage <- 1-(time.in.storage*loss.per.day*fudge) 
+  eff.tot <- eff.liq*eff.storage
+  return(eff.tot)
+}
+
+#Hydrogen ship cost. A lot of uncertainty on this component
+#costs are between 120M and 43M/ship. An LNG tanker is 71M/ship according to Saadi et al. (2018)
+#Alkhaledi et al. (2022) estimates $440M/ship for a 280,000m^3 ship or 20,000ton capacity.
+Ship.volume <- 280000 #Capacity in m^3
+Ship.mass <- 20000 #Capacity in tons
+
+Ship.unit.cost <- 440 #MUSD/ship. 
+H2Ship.cost <- function(n = 1) return(Ship.unit.cost*n) #in MUSD/plant
+
+```
+
+
+```{r EXECUTE: Add Alternative Value Chain Metrics}
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes)
+#to loop through each data table
+for(i in 1:nrow(My.DTs)) {
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+
+  #get the name of the DT as a character string
+  this.dt <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".dt", sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt))     #this will give an error if the DT is not found
+  
+  this.dt[ , ':='(Plant.cost.transformer = Transformer.cost(this.size)/1000000,
+                  Plant.cost.electrolyzer = Electrolyzer.cost(this.size)/1000000,
+                  Plant.cost.H2Ships = H2Ship.cost(),
+                  Plant.efficiency.H2 = Loss.H2(dist.km = Shore_dist))]
+} 
+
+#Adds 4 columns
+
+```
+
+
+```{r FUNCTIONS: Influence Area}
+
+#check for gaps in bins. This would mean there is a clear gap in the plant that could have a landmass inside. This only finds horizontal or vertical gaps, it cannot find diagonal gaps, but it will find the gap between east and west coasts.
+Check.Gap <- function(DT,bin.lat,bin.lon) { #checks if the given DT has any gaps in longitude or latitude, and if so, returns the part of the DT that is where the collector square is
+  all.bins.lat <- as.integer(sort(unique(DT$Bin_lat))) #returns an ordered vector of bin values
+  all.bins.lon <- as.integer(sort(unique(DT$Bin_lon)))
+  
+  if((sum(diff(all.bins.lat) - 1) + sum(diff(all.bins.lon) - 1)) == 0){ #there are no gaps
+    return(DT)
+  } else { #there is a gap. Note: this will not find if there is a diagonal gap, it has to be a completely vertical or horizontal gap in the grid squares. But it will find the continental divide gap between west and east coasts.
+    lat.pos <- match(bin.lat, all.bins.lat) #gives the index of where the current square is
+    lon.pos <- match(bin.lon, all.bins.lon)
+    
+    #Check if gap is to the north
+    if(sum(diff(all.bins.lat[lat.pos:length(all.bins.lat)]) - 1) == 0) {
+      max.lat <- max(all.bins.lat)
+    } else {
+      max.lat.pos <- lat.pos #initiate starting square
+      #step north from collector.square
+      while(!is.na(all.bins.lat[max.lat.pos + 1])) { #while the next element exists
+        gap <- abs(all.bins.lat[max.lat.pos + 1] - all.bins.lat[max.lat.pos])
+        if(gap == 1) { #if the gap to the next one is 1
+          max.lat.pos <- max.lat.pos + 1 #the max position assumes that next position
+          } else { #or else we are done
+            break
+          }
+      }
+      max.lat <- all.bins.lat[max.lat.pos]
+    }
+    
+    #Check if gap is to the south
+    if(sum(diff(all.bins.lat[1:lat.pos]) - 1) == 0) {
+      min.lat <- min(all.bins.lat)
+    } else {
+      min.lat.pos <- lat.pos    
+      #step south from collector.square
+      while(!is.na(all.bins.lat[min.lat.pos - 1])) { 
+        gap <- abs(all.bins.lat[min.lat.pos] - all.bins.lat[min.lat.pos - 1])
+        if(gap == 1) {
+          min.lat.pos <- min.lat.pos - 1
+        } else {
+          break
+        }
+      }
+      min.lat <- all.bins.lat[min.lat.pos]
+    }
+    
+    #Check if gap is to the east
+    if(sum(diff(all.bins.lon[lon.pos:length(all.bins.lon)]) - 1) == 0) {
+      max.lon <- max(all.bins.lon)
+    } else {
+      max.lon.pos <- lon.pos
+      #step east from collector.square
+      while(!is.na(all.bins.lon[max.lon.pos + 1])) { #while the next element exists
+        gap <- abs(all.bins.lon[max.lon.pos + 1] - all.bins.lon[max.lon.pos])
+        if(gap == 1) { #if the gap to the next one is 1
+          max.lon.pos <- max.lon.pos + 1 #the max position assumes that next position
+        } else { #or else we are done
+          break
+        }
+      }
+      max.lon <- all.bins.lon[max.lon.pos]
+    }
+      
+    #Check if gap is to the west
+    if(sum(diff(all.bins.lon[1:lon.pos]) - 1) == 0) {
+      min.lon <- min(all.bins.lon)
+    } else {
+      min.lon.pos <- lon.pos
+      #step west from collector.square
+      while(!is.na(all.bins.lon[min.lon.pos - 1])) { 
+        gap <- abs(all.bins.lon[min.lon.pos] - all.bins.lon[min.lon.pos - 1])
+        if(gap == 1) {
+          min.lon.pos <- min.lon.pos - 1
+        } else {
+          break
+        }
+      }
+      min.lon <- all.bins.lon[min.lon.pos]
+    }
+      
+    DT <- DT[Bin_lon %between% c(min.lon,max.lon) & Bin_lat %between% c(min.lat,max.lat), ]
+    return(DT)
+  }
+}
+
+
+#Function to get the whole Influence Area. Depends only on plant and turbine size.
+Collect <- function(Grid.Square,Main.DT,turbine.MW,plant.MW) { #input is a row of the large data table, corresponding to a grid square
+  lat.bin <- Grid.Square$Bin_lat 
+  lon.bin <- Grid.Square$Bin_lon
+  
+  nturb <- ceiling(plant.MW/turbine.MW) #number of turbines in the plant
+  side.l <- ceiling(sqrt(nturb)) #max dist from center in number of turbines
+  
+  IA.DT <- Main.DT[Bin_lon %between% c(lon.bin-side.l, lon.bin+side.l) & Bin_lat %between% c(lat.bin-side.l, lat.bin+side.l), ]
+  
+  IA.DT <- Check.Gap(IA.DT,lat.bin,lon.bin)
+  
+  return(IA.DT)
+}
+```
+
+
+```{r FUNCTIONS: Plant Metrics Functions}
+#All Plant-site metrics. Written in APPLY fashion. Input is of data.table type
+#This will be executed for each combination of turbine,substructure,plant size, and transmission type
+Plant.Site.Metrics.apply <- function(ID.n, Main.DT, turbine.MW, plant.MW) {
+  n.chains <- 3 #number of mooring chains assumed. used later in this function
+  #set up empty data.table
+  result <- data.table("ID" = integer(),
+                       "Plant.cost.IA.fixed" = double(),
+                       "Plant.cost.IA.floating" = double(),
+                       "Plant.cost.turbine" = double(),
+                       "Plant.cost.monopile" = double(),
+                       "Plant.cost.semisub" = double(),
+                       "Plant.cost.mooring" = double(),
+                       "Plant.cost.DP" = double(),
+                       "Plant.gross.NRG.fixed" = double(),
+                       "Plant.gross.NRG.moored" = double(),
+                       "Plant.gross.NRG.DP" = double(),
+                       "Plant.moorings" = double(),
+                       "Plant.seabed.moorings" = double(),
+                       "Plant.visible.fixed" = double(),
+                       "Plant.visible.moored" = double(),
+                       "Plant.visible.DP" = double(),
+                       "Plant.vessels.fixed" = double(),
+                       "Plant.vessels.moored" = double(),
+                       "Plant.vessels.DP" = double(),
+                       "Plant.fishing.eff.fixed" = double(),
+                       "Plant.fishing.eff.moored" = double(),
+                       "Plant.fishing.eff.DP" = double(),
+                       "Plant.marine.life.fixed" = double(),
+                       "Plant.marine.life.moored" = double(),
+                       "Plant.marine.life.DP" = double(),
+                       "Plant.bird.life.fixed" = double(),
+                       "Plant.bird.life.moored" = double(),
+                       "Plant.bird.life.DP" = double(),
+                       "Plant.seabed.moorings.area" = double(),
+                       "Plant.seabed.scour.area" = double(),
+                       "Plant.fixed.foundations.volume" = double(),
+                       "Plant.semisub.volume" = double(),
+                       "Plant.mean.depth.fixed" = double(),
+                       "Plant.mean.depth.moored" = double(),
+                       "Plant.mean.depth.DP" = double(),
+                       "Plant.N.turbines" = integer())
+  
+  #Just a blank row of NAs
+  r.NA <- rbindlist(list(result, data.table("ID" = ID.n)), fill = TRUE)
+  
+  if(!(turbine.MW %in% c(5,8,10,15))) stop("This is not a valid Turbine size")
+  if(!(plant.MW %in% c(200,400,600,800,1000,1200,1400))) stop("This is not a valid Plant size")
+  
+  nturb <- ceiling(plant.MW/turbine.MW)
+  collector.square <- Main.DT[ID == ID.n, ] #gives the row
+  if(dim(collector.square)[1] == 0) stop("This is not a valid ID in the Data Table")
+  
+  if(collector.square$MPA == 1) {return(r.NA)} #can't place a collector here because of the overlap with an MPA, therefore, there is no plant here
+  
+  plant.grid <- Collect(collector.square,Main.DT,turbine.MW,plant.MW) #returns a DT
+  collector.square.pos <- match(collector.square$ID, plant.grid$ID)
+  plant.grid <- plant.grid[-collector.square.pos]
+  
+  plant.grid.moored <- plant.grid[depxmoored == 1 & cabxmoored == 1, ]
+  plant.grid.fixed <- plant.grid[depxfixed == 1 & cabxfixed == 1, ]
+  
+  eff.plants <- nrow(plant.grid)/nturb #effective plants based on allowed turbine sites
+  eff.plants.moored <- nrow(plant.grid.moored)/nturb #effective moored foundation plants
+  eff.plants.fixed <- nrow(plant.grid.fixed)/nturb #effective fixed foundation plants
+  
+  if(eff.plants < 1) { #if the available squares are not enough, we set res here.
+    return(r.NA)
+    } else { #else continue calculating metrics
+      #Set Cost Metrics based on plant size. These are now MUSD/PLANT on that grid square
+      Plant.cost.IA.fixed.val <- sum(plant.grid[ , "cost.IA.fixed"], na.rm = TRUE)/eff.plants #MUSD
+      Plant.cost.IA.floating.val <- sum(plant.grid[ , "cost.IA.floating"], na.rm = TRUE)/eff.plants #MUSD
+      Plant.cost.turbine.val <- sum(plant.grid[ , "cost.turbine"], na.rm = TRUE)/eff.plants
+      Plant.cost.monopile.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "cost.monopile"], na.rm = TRUE)/eff.plants.fixed) #only for grid squares in the influence area that are less than the depth limit
+      Plant.cost.semisub.val <- sum(plant.grid[ , "cost.semisub"], na.rm = TRUE)/eff.plants #MUSD. Doesn't change with depths
+      Plant.cost.mooring.val <- ifelse(eff.plants.moored < 1, NA, n.chains*sum(plant.grid.moored[ , "cost.mooring"], na.rm = TRUE)/eff.plants.moored) #only for grid squares in the influence area that are less than the depth limit
+      Plant.cost.DP.val <- sum(plant.grid[ , "cost.DP"], na.rm = TRUE)/eff.plants #MUSD
+      
+      #Energy when it arrives to the collectors. assume efficiency of IA cables is 100%
+      Plant.gross.NRG.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "NRG.turbine.year"], na.rm = TRUE)/eff.plants.fixed)
+      Plant.gross.NRG.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "NRG.turbine.year"], na.rm = TRUE)/eff.plants.moored)
+      Plant.gross.NRG.DP.val <- sum(plant.grid[ , "NRG.turbine.year.DP"], na.rm = TRUE)/eff.plants
+        
+      ##Other plant metrics
+      #submerged moorings. length
+      Plant.moorings.val <- ifelse(eff.plants.moored < 1, NA, n.chains*sum(plant.grid.moored[ , "moorings.high"], na.rm = TRUE)/eff.plants.moored) 
+      
+      #seabed moorings. length
+      Plant.seabed.moorings.val <- ifelse(eff.plants.moored < 1, NA, n.chains*sum(plant.grid.moored[ , "seabed.moorings"], na.rm = TRUE)/eff.plants.moored)
+      
+      #seabed disturbed area from moorings. area
+      Plant.moorings.area.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "seabed.moorings.area"], na.rm = TRUE)/eff.plants.moored)
+      
+      #visible
+      Plant.visible.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "visible"], na.rm = TRUE)/eff.plants.fixed) #near the edge of its depth limit, fewer turbines will be part of the plant.
+      Plant.visible.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "visible"], na.rm = TRUE)/eff.plants.moored)
+      Plant.visible.DP.val <- sum(plant.grid[ ,"visible"], na.rm = TRUE)/eff.plants
+      
+      #vessels
+      Plant.vessels.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "Vessels"], na.rm = TRUE)/eff.plants.fixed) #near the edge of its depth limit, fewer turbines will be part of the plant.
+      Plant.vessels.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "Vessels"], na.rm = TRUE)/eff.plants.moored)
+      Plant.vessels.DP.val <- sum(plant.grid[ ,"Vessels"], na.rm = TRUE)/eff.plants
+      
+      #fishing effort
+      Plant.fishing.eff.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "FEH_max"], na.rm = TRUE)/eff.plants.fixed) #near the edge of its depth limit, fewer turbines will be part of the plant.
+      Plant.fishing.eff.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "FEH_max"], na.rm = TRUE)/eff.plants.moored)
+      Plant.fishing.eff.DP.val <- sum(plant.grid[ ,"FEH_max"], na.rm = TRUE)/eff.plants
+      
+      #marine life. species richness
+      Plant.marine.life.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "Marine_life_SR"], na.rm = TRUE)/eff.plants.fixed) #near the edge of its depth limit, fewer turbines will be part of the plant.
+      Plant.marine.life.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ , "Marine_life_SR"], na.rm = TRUE)/eff.plants.moored)
+      Plant.marine.life.DP.val <- sum(plant.grid[ ,"Marine_life_SR"], na.rm = TRUE)/eff.plants
+      
+      #seabed disturbed area from scour (fixed foundations)
+      Plant.seabed.scour.area.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ ,"seabed.monopile"], na.rm = TRUE)/eff.plants.fixed)
+      
+      #volume of fixed foundations
+      Plant.fixed.foundations.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ , "fixed.foundation"], na.rm = TRUE)/eff.plants.fixed)
+      
+      #number of turbines
+      Plant.N.turbines.val <- ceiling(plant.MW/turbine.MW)
+      
+      #volume of semisubmersible foundations
+      Plant.semisub.volume.val <- sum(plant.grid[ , "semisub.volume"], na.rm = TRUE)/eff.plants #should just be N.turbines * semisub.volume
+      
+      #Plant mean depth
+      Plant.mean.depth.fixed.val <- ifelse(eff.plants.fixed < 1, NA, sum(plant.grid.fixed[ ,"Depth_mean"], na.rm = TRUE)/nrow(plant.grid.fixed)) #will come out as negative
+      Plant.mean.depth.moored.val <- ifelse(eff.plants.moored < 1, NA, sum(plant.grid.moored[ ,"Depth_mean"], na.rm = TRUE)/nrow(plant.grid.moored))
+      Plant.mean.depth.DP.val <- ifelse(eff.plants < 1, NA, sum(plant.grid[ ,"Depth_mean"], na.rm = TRUE)/nrow(plant.grid))
+    
+      r <- data.table("ID" = ID.n,
+                      "Plant.cost.IA.fixed" = Plant.cost.IA.fixed.val,
+                      "Plant.cost.IA.floating" = Plant.cost.IA.floating.val,
+                      "Plant.cost.turbine" = Plant.cost.turbine.val,
+                      "Plant.cost.monopile" = Plant.cost.monopile.val,
+                      "Plant.cost.semisub" = Plant.cost.semisub.val,
+                      "Plant.cost.mooring" = Plant.cost.mooring.val,
+                      "Plant.cost.DP" = Plant.cost.DP.val,
+                      "Plant.gross.NRG.fixed" = Plant.gross.NRG.fixed.val,
+                      "Plant.gross.NRG.moored" = Plant.gross.NRG.moored.val,
+                      "Plant.gross.NRG.DP" = Plant.gross.NRG.DP.val,
+                      "Plant.moorings" = Plant.moorings.val,
+                      "Plant.seabed.moorings" = Plant.seabed.moorings.val,
+                      "Plant.visible.fixed" = Plant.visible.fixed.val,
+                      "Plant.visible.moored" = Plant.visible.moored.val,
+                      "Plant.visible.DP" = Plant.visible.DP.val,
+                      "Plant.vessels.fixed" = Plant.vessels.fixed.val,
+                      "Plant.vessels.moored" = Plant.vessels.moored.val,
+                      "Plant.vessels.DP" = Plant.vessels.DP.val,
+                      "Plant.fishing.eff.fixed" = Plant.fishing.eff.fixed.val,
+                      "Plant.fishing.eff.moored" = Plant.fishing.eff.moored.val,
+                      "Plant.fishing.eff.DP" = Plant.fishing.eff.DP.val,
+                      "Plant.marine.life.fixed" = Plant.marine.life.fixed.val,
+                      "Plant.marine.life.moored" = Plant.marine.life.moored.val,
+                      "Plant.marine.life.DP" = Plant.marine.life.DP.val,
+                      "Plant.bird.life.fixed" = NA, #placeholder
+                      "Plant.bird.life.moored" = NA, #placeholder
+                      "Plant.bird.life.DP" = NA, #placeholder
+                      "Plant.seabed.moorings.area" = Plant.moorings.area.val,
+                      "Plant.seabed.scour.area" = Plant.seabed.scour.area.val,
+                      "Plant.fixed.foundations.volume" = Plant.fixed.foundations.val,
+                      "Plant.semisub.volume" = Plant.semisub.volume.val,
+                      "Plant.mean.depth.fixed" = Plant.mean.depth.fixed.val,
+                      "Plant.mean.depth.moored" = Plant.mean.depth.moored.val,
+                      "Plant.mean.depth.DP" = Plant.mean.depth.DP.val,
+                      "Plant.N.turbines" = Plant.N.turbines.val)
+      
+      result <- rbind(result, r)
+    }
+  return(result) #res only has the new metrics. It must be merged with the main dataframe using 'ID'
+}
+```
+
+
+```{r FUNCTIONS: Parallel Computing with Apply Function}
+
+#In a Sequential Apply Function. NOT PARALLEL
+Apply.Computing <- function(DT, TURB.MW, PLANT.MW) {
+  my.dt.name <- deparse(substitute(DT))
+  DT.IDs <- DT[1:1000 ,"ID"] #gets all the IDs in the datatable
+  DT.IDs <- unlist(DT.IDs, use.names = FALSE) #turns named list into a simple vector
+  DT.IDs <- as.integer(DT.IDs) #converts into an integer which is smaller
+
+  RESULT <- lapply(DT.IDs, Plant.Site.Metrics.apply, Main.DT = DT, turbine.MW = TURB.MW, plant.MW = PLANT.MW)
+                          
+  RESULT.DT <- rbindlist(RESULT)
+  
+  Joined.dt <- merge(DT, RESULT.DT, by = "ID", all = TRUE)
+  
+  return(Joined.dt)
+}
+
+#Using Parallel processors
+Parallel.Computing <- function(DT, DT.NAME, TURB.MW, PLANT.MW) {
+  my.dt.name <- deparse(substitute(DT))
+  DT.IDs <- DT[ ,"ID"] #gets all the IDs in the datatable
+  DT.IDs <- unlist(DT.IDs, use.names = FALSE) #turns named list into a simple vector
+  DT.IDs <- as.integer(DT.IDs) #converts into an integer which is smaller
+  numCores <- detectCores() - 2 #8 processors
+  
+  cl <- makeCluster(numCores)
+  
+  clusterEvalQ(cl, {
+    library(data.table)
+    library(dplyr)
+    })
+
+  clusterExport(cl, c(DT.NAME,"Collect","Check.Gap"))
+
+  #This is where the parallel run occurs
+  RESULT <- parLapply(cl, DT.IDs, Plant.Site.Metrics.apply, Main.DT = DT, turbine.MW = TURB.MW, plant.MW = PLANT.MW)
+                          
+  RESULT.DT <- rbindlist(RESULT)
+
+  stopCluster(cl)
+  
+  Joined.dt <- merge(DT, RESULT.DT, by = "ID", all = TRUE)
+  
+  return(Joined.dt)
+}
+
+```
+
+
+```{r EXECUTE: Compute Final Metrics and Combine Data.Tables}
+#This block takes about 75 minutes per value chain to run.
+longitude.divide <- -105
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+
+#Loop through data frames
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes)
+dt.n <- dim(My.DTs)[1]
+#to loop through each data table
+exec.time <- c() #check how long each loop takes
+
+for(i in 1:nrow(My.DTs)) {
+  start <- Sys.time()
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".dt", sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name))     #this will give an error if the DT is not found
+  #subset into west and east sides (for faster filtering)
+  this.dt.west <- this.dt[Longitude <= longitude.divide] #334787 x 55
+  this.dt.east <- this.dt[Longitude > longitude.divide] #533277 x 55
+  
+  this.dt.west <- Parallel.Computing(this.dt.west, "this.dt.west", this.turb, this.size)
+  this.dt.east <- Parallel.Computing(this.dt.east, "this.dt.east", this.turb, this.size)
+  
+  this.dt <- rbind(this.dt.west,this.dt.east)
+  this.dt <- setDT(this.dt) #just making sure it's still a dt
+  
+  assign(this.dt.name, this.dt)
+  print(dt.n - i) #number of dt left
+  exec.time <- c(exec.time, Sys.time() - start)
+  time <- mean(exec.time) * (dt.n - i)
+  print(time) #estimated time remaining
+  finish(1)
+  
+  #decide whether or not to continue after every 4th data table
+  # if(i %% 4 == 0){
+  #   finish(10)
+  #   cont <- readline(prompt = "Continue? (Yes/No): ")
+  #     
+  #     if(cont == "No") {
+  #       message("The execution has been terminated.")
+  #       break
+  #     }
+  # }
+  
+}
+finish(10)
+
+rm(this.dt.west)
+rm(this.dt.east)
+```
+
+
+```{r EXECUTE: Reordering Columns - If needed}
+### Reorder Columns. Resultant DTs have 92 columns
+col.names <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","Depth_mean","Depth_vari","Shore_ID","Shore_dist","Cab_len","MPA","FEH_mean","FEH_max","POI_ID","POI_dist","POI23_ID","POI23_dist","Port_ID","Port_dist","Cap_factor","Windspeed","Land_dist_trans","Vessels","Marine_life_SR","Marine_life_shannon","visible","depxfixed","depxmoored","cabxfixed","cabxmoored","moorings.low","moorings.high","seabed.moorings","seabed.moorings.area","seabed.monopile","fixed.foundation","semisub.volume","cost.turbine","cost.monopile","cost.semisub","cost.mooring","cost.DP","Plant.cost.onshorecable","cost.IA.fixed","cost.IA.floating","NRG.turbine.year","NRG.turbine.year.DP","Plant.seabed.cable.AC","Plant.cost.export.AC","Plant.efficiency.AC","Plant.seabed.cable.DC","Plant.cost.export.DC","Plant.efficiency.DC","Plant.cost.transformer","Plant.cost.electrolyzer","Plant.cost.H2Ships","Plant.efficiency.H2","Plant.cost.IA.fixed","Plant.cost.IA.floating","Plant.cost.turbine","Plant.cost.monopile","Plant.cost.semisub","Plant.cost.mooring","Plant.cost.DP","Plant.gross.NRG.fixed","Plant.gross.NRG.moored","Plant.gross.NRG.DP","Plant.moorings","Plant.seabed.moorings","Plant.seabed.moorings.area","Plant.seabed.scour.area","Plant.fixed.foundations.volume","Plant.visible.fixed","Plant.semisub.volume","Plant.visible.moored","Plant.visible.DP","Plant.vessels.fixed","Plant.vessels.moored","Plant.vessels.DP","Plant.fishing.eff.fixed","Plant.fishing.eff.moored","Plant.fishing.eff.DP","Plant.marine.life.fixed","Plant.marine.life.moored","Plant.marine.life.DP","Plant.bird.life.fixed","Plant.bird.life.moored","Plant.bird.life.DP","Plant.mean.depth.fixed","Plant.mean.depth.moored","Plant.mean.depth.DP","Plant.N.turbines")
+
+#Loop through columns to set order
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes)
+
+for(i in 1:nrow(My.DTs)) {
+  start <- Sys.time()
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".dt", sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+  
+  setcolorder(this.dt, col.names)
+  
+}
+```
+
+```{r SAVE: Turbine and Plant Data Tables}
+
+#Loop through columns to set order
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes)
+
+for(i in 1:nrow(My.DTs)) {
+  start <- Sys.time()
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".dt", sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+  
+  #### Now that you have the DT, do something
+  this.filepath <- paste("~/",this.dt.name,".csv",sep = "")
+  
+  write.csv(this.dt, this.filepath) #save the csv to the given filepath
+}
+```
+
+
+```{r FUNCTION: LCOE Function}
+LCOE <- function(OCC, plant.MW, ann.energy, ann.maint = 93, r = 0.054, life = 25) { #MUSD, MW, MWh or tH2, USD/kW 
+  Inv <- OCC*1000000 #USD
+  Ann.V <- rep(plant.MW*1000*ann.maint,times = life) #USD
+  # NPV.CF <- NPV(-Inv, -Ann.V, times = 1:life, i = r)
+  CF <- c(Inv,Ann.V)
+  times.V <- 0:life
+  NPV.CF <- sum(CF/(1+r)^times.V)
+  
+  Ann.E <- rep(ann.energy*1000, times = life) #kWh or kgH2 
+  CF.E <- c(0,Ann.E)
+  # NPV.E <- NPV(0, Ann.E, times = 1:life, i = r)
+  NPV.E <- sum(CF.E/(1+r)^times.V)
+  
+  LCOE <- round(NPV.CF/NPV.E,2)
+  
+  return(LCOE*1000) #returns value in USD/MWh or USD/tH2
+}
+
+```
+
+
+```{r FUNCTIONS: Create Value Chain Specific Data Tables and Calculate Absolute Plant Metrics}
+Value.Chain.DT <- function(turb.plant.dt, SK.type, TR.type, Plant.MW, Turb.MW) {
+  if(!(SK.type %in% c("FI","MO","DP"))) stop("This is not a valid stationkeeping type. Choose: FI, MO, or DP")
+  if(!(TR.type %in% c("AC","DC","H2"))) stop("This is not a valid transmission method. Choose: AC, DC, or H2")
+  
+  Result.dt = copy(turb.plant.dt)
+
+  Eff.Plant.MW <- ceiling(Plant.MW/Turb.MW)*Turb.MW
+  if(abs(Eff.Plant.MW - Plant.MW) > 10) stop("There is an issue with the plant size") #the actual plant size (considering discrete numbers of turbines) is different by a maxium of 10 MW. a 1400 MW plant with 15 MW turbines = 1410 MW
+  test.vec <- Result.dt$Plant.N.turbines*Turb.MW
+  if(sum(!test.vec %in% c(Eff.Plant.MW,NA)) > 0) stop("There is an issue with the plant size") #Checking that the Plant.N.turbines value agrees with the Effective Plant MW value computed here. This is a check on earlier computations.
+  
+  Plant.MW <- Eff.Plant.MW #proceed if the following two checks are correct. This changes the plant MW to account for discrete number of turbines. This only affects 4 turbine-plant combos
+  
+    #Fixed foundations & Transmission types
+    if(SK.type == "FI" & TR.type == "AC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.fixed) | depxfixed == 0 | cabxfixed == 0 | MPA == 1, NA, 1)] #returns NA if a plant does not fit there for one of several reasons. 
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.monopile + Plant.cost.IA.floating + Plant.cost.export.AC + Plant.cost.onshorecable)] #in MUSD
+      Result.dt[ , Plant.NRG := PLANT*(Plant.gross.NRG.fixed*Plant.efficiency.AC)] #in MWh
+      Result.dt[ , Plant.H2 := PLANT*0] #in tH2
+      Result.dt[ , Plant.uOCC := PLANT*Plant.OCC*1000/Plant.MW] #in USD/kW
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))] #in USD/MWh
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.fixed]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.fixed]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.fixed]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.fixed]
+      Result.dt[ , Plant.SEABED := PLANT*(Plant.seabed.scour.area/(1000^2)+Plant.seabed.cable.AC)] #in km^2
+      Result.dt[ , Plant.F.OBST := PLANT*(Plant.fixed.foundations.volume)] #in m^3. plant fixed obstructions (from substructures)
+      Result.dt[ , Plant.L.OBST := PLANT*0] #in km. length of submerged mooring chain obstructions
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST] #considers that due to swept volume calculations, mooring chains occupy 1m^3/m of length
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] #in sq.km. each turbine occupies 4 sq.km (2x2)
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.fixed/1000))] #in km^3
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] #in m^3/km^3
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] #in km^2/km^2
+      
+    }
+  
+    if(SK.type == "FI" & TR.type == "DC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.fixed) | depxfixed == 0 | cabxfixed == 0 | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.monopile + Plant.cost.IA.floating + Plant.cost.export.DC + Plant.cost.onshorecable)] #in MUSD
+      Result.dt[ , Plant.NRG := PLANT*(Plant.gross.NRG.fixed*Plant.efficiency.DC)] #in MWh
+      Result.dt[ , Plant.H2 := PLANT*0] #in tH2
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] #in USD/kW
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))] #in USD/MWh
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.fixed]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.fixed]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.fixed]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.fixed]
+      Result.dt[ , Plant.SEABED := PLANT*(Plant.seabed.scour.area/(1000^2)+Plant.seabed.cable.DC)] #in km^2
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.fixed.foundations.volume] #in m^3. plant fixed obstructions (from substructures)
+      Result.dt[ , Plant.L.OBST := PLANT*0] #in km. length of submerged mooring chain obstructions
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] #in sq.km. each turbine occupies 4 sq.km (2x2)
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.fixed/1000))] #in km^3
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] #in m^3/km^3
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] #in km^2/km^2
+
+    }
+  
+    if(SK.type == "FI" & TR.type == "H2") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.fixed) | depxfixed == 0 | cabxfixed == 0 | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.monopile + Plant.cost.IA.floating + Plant.cost.transformer + Plant.cost.electrolyzer + Plant.cost.H2Ships)] #in MUSD
+      Result.dt[ , Plant.NRG := PLANT*0] #in MWh
+      Result.dt[ , Plant.H2 := PLANT*(H2.gen(Plant.gross.NRG.fixed)*Plant.efficiency.H2)] #in tH2
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] #in USD/kW
+      Result.dt[ , Plant.LCOE := PLANT*0] #in USD/MWh
+      Result.dt[ , Plant.LCOH2 := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.H2))] #in USD/tH2
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.fixed]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.fixed]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.fixed]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.fixed]
+      Result.dt[ , Plant.SEABED := PLANT*Plant.seabed.scour.area/(1000^2)] #in km^2
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.fixed.foundations.volume] #in m^3. plant fixed obstructions (from substructures)
+      Result.dt[ , Plant.L.OBST := PLANT*0] #in km. length of submerged mooring chain obstructions
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] #in sq.km. each turbine occupies 4 sq.km (2x2)
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.fixed/1000))] #in km^3
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] #in m^3/km^3
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] #in km^2/km^2
+
+    }
+  
+    #Moored foundations & Transmission types
+    if(SK.type == "MO" & TR.type == "AC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.moored) | depxmoored == 0 | cabxmoored == 0 | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.mooring + Plant.cost.IA.floating + Plant.cost.export.AC + Plant.cost.onshorecable)] 
+      Result.dt[ , Plant.NRG := PLANT*(Plant.gross.NRG.moored*Plant.efficiency.AC)] 
+      Result.dt[ , Plant.H2 := PLANT*0] 
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] 
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))]
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.moored]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.moored]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.moored]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.moored]
+      Result.dt[ , Plant.SEABED := PLANT*(Plant.seabed.moorings.area/(1000^2)+Plant.seabed.cable.AC)] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*(Plant.moorings/1000)] 
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.moored/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+
+    }
+  
+    if(SK.type == "MO" & TR.type == "DC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.moored) | depxmoored == 0 | cabxmoored == 0 | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.mooring + Plant.cost.IA.floating + Plant.cost.export.DC + Plant.cost.onshorecable)] 
+      Result.dt[ , Plant.NRG := PLANT*(Plant.gross.NRG.moored*Plant.efficiency.DC)] 
+      Result.dt[ , Plant.H2 := PLANT*0] 
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] 
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))]
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.moored]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.moored]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.moored]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.moored]
+      Result.dt[ , Plant.SEABED := PLANT*(Plant.seabed.moorings.area/(1000^2)+Plant.seabed.cable.DC)] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*(Plant.moorings/1000)] 
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.moored/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+
+    }
+  
+    if(SK.type == "MO" & TR.type == "H2") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.moored) | depxmoored == 0 | cabxmoored == 0 | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.mooring + Plant.cost.IA.floating + Plant.cost.transformer + Plant.cost.electrolyzer + Plant.cost.H2Ships)]
+      Result.dt[ , Plant.NRG := PLANT*0]
+      Result.dt[ , Plant.H2 := PLANT*(H2.gen(Plant.gross.NRG.moored)*Plant.efficiency.H2)]
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)]
+      Result.dt[ , Plant.LCOE := PLANT*0]
+      Result.dt[ , Plant.LCOH2 := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.H2))]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.moored]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.moored]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.moored]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.moored]
+      Result.dt[ , Plant.SEABED := PLANT*(Plant.seabed.moorings.area/(1000^2))] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*(Plant.moorings/1000)] 
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.moored/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+
+    }
+  
+    #DP foundations & Transmission types
+    if(SK.type == "DP" & TR.type == "AC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.DP) | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.DP + Plant.cost.IA.floating + Plant.cost.export.AC + Plant.cost.onshorecable)] 
+      Result.dt[ , Plant.NRG := PLANT*Plant.gross.NRG.DP*Plant.efficiency.AC] 
+      Result.dt[ , Plant.H2 := PLANT*0] 
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] 
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))]
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.DP]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.DP]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.DP]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.DP]
+      Result.dt[ , Plant.SEABED := PLANT*Plant.seabed.cable.AC] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*0]  
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.DP/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+    }
+  
+    if(SK.type == "DP" & TR.type == "DC") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.DP) | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.DP + Plant.cost.IA.floating + Plant.cost.export.DC + Plant.cost.onshorecable)] 
+      Result.dt[ , Plant.NRG := PLANT*(Plant.gross.NRG.DP*Plant.efficiency.DC)] 
+      Result.dt[ , Plant.H2 := PLANT*0] 
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)] 
+      Result.dt[ , Plant.LCOE := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.NRG))]
+      Result.dt[ , Plant.LCOH2 := PLANT*0]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.DP]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.DP]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.DP]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.DP]
+      Result.dt[ , Plant.SEABED := PLANT*Plant.seabed.cable.DC] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*0] 
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.DP/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+
+    }
+  
+    if(SK.type == "DP" & TR.type == "H2") {
+      Result.dt[ , PLANT := ifelse(is.na(Plant.gross.NRG.DP) | MPA == 1, NA, 1)]
+      Result.dt[ , Plant.OCC := PLANT*(Plant.cost.turbine + Plant.cost.semisub + Plant.cost.IA.floating + Plant.cost.transformer + Plant.cost.electrolyzer + Plant.cost.H2Ships)]
+      Result.dt[ , Plant.NRG := PLANT*0]
+      Result.dt[ , Plant.H2 := PLANT*(H2.gen(Plant.gross.NRG.DP)*Plant.efficiency.H2)]
+      Result.dt[ , Plant.uOCC := PLANT*(Plant.OCC*1000/Plant.MW)]
+      Result.dt[ , Plant.LCOE := PLANT*0]
+      Result.dt[ , Plant.LCOH2 := PLANT*(mapply(LCOE, OCC = Plant.OCC, plant.MW = Plant.MW, ann.energy = Plant.H2))]
+      Result.dt[ , Plant.VIZ.IMP := PLANT*Plant.visible.DP]
+      Result.dt[ , Plant.FE.IMP := PLANT*Plant.fishing.eff.DP]
+      Result.dt[ , Plant.ML.IMP := PLANT*Plant.marine.life.DP]
+      Result.dt[ , Plant.VES.IMP := PLANT*Plant.vessels.DP]
+      Result.dt[ , Plant.SEABED := PLANT*0] 
+      Result.dt[ , Plant.F.OBST := PLANT*Plant.semisub.volume] 
+      Result.dt[ , Plant.L.OBST := PLANT*0]
+      Result.dt[ , Plant.OBST := Plant.L.OBST + Plant.F.OBST]
+      
+      Result.dt[ , Plant.Area := PLANT*(Plant.N.turbines*4)] 
+      Result.dt[ , Plant.Volume := PLANT*(Plant.Area*(-Plant.mean.depth.DP/1000))] 
+      Result.dt[ , Plant.OBST.Density := PLANT*(Plant.OBST/Plant.Volume)] 
+      Result.dt[ , Plant.SEABED.Density := PLANT*(Plant.SEABED/Plant.Area)] 
+
+    }
+  
+  ####Reduce result to only the columns that are needed. Anything with "Plant" at the start of the column.
+  result.cols <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","PLANT","Shore_dist","Depth_mean","Plant.OCC","Plant.uOCC","Plant.NRG","Plant.H2","Plant.LCOE","Plant.LCOH2","Plant.VIZ.IMP","Plant.FE.IMP","Plant.ML.IMP","Plant.VES.IMP","Plant.SEABED","Plant.OBST","Plant.OBST.Density","Plant.SEABED.Density") 
+  Result.dt <- Result.dt[ , ..result.cols]
+    
+  #assure that some of the columns are integers to save data space
+  int.cols <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","PLANT","Shore_dist","Depth_mean","Plant.OCC","Plant.NRG","Plant.H2","Plant.uOCC")
+  Result.dt[ , (int.cols) := lapply(.SD, as.integer),
+             .SDcols = int.cols]
+  
+  setcolorder(Result.dt, result.cols)
+  return(Result.dt) #only return the plant metric columns
+}
+
+```
+
+#With Station-keeping and Transmission Choices - 168 Combinations + 1 No-Action 
+```{r EXECUTE: The No Action Value Chain}
+No.Action.dt = copy(T5.200.dt)
+
+No.Action.dt[ , Plant.OCC := 0] #YES
+No.Action.dt[ , Plant.NRG := 0] #YES
+No.Action.dt[ , Plant.H2 := 0] #YES
+No.Action.dt[ , Plant.uOCC := 0] #YES
+No.Action.dt[ , Plant.LCOE := 0] #YES
+No.Action.dt[ , Plant.LCOH2 := 0] #YES
+No.Action.dt[ , Plant.VIZ.IMP := 0] #YES
+No.Action.dt[ , Plant.FE.IMP := 0] #YES
+No.Action.dt[ , Plant.ML.IMP := 0] #YES
+No.Action.dt[ , Plant.VES.IMP := 0] #YES
+No.Action.dt[ , Plant.SEABED := 0] #YES
+No.Action.dt[ , Plant.OBST := 0] #YES
+
+No.Action.dt[ , Plant.Area := 0] 
+No.Action.dt[ , Plant.Volume := 0] 
+No.Action.dt[ , Plant.OBST.Density := 0] #YES
+No.Action.dt[ , Plant.SEABED.Density := 0] #YES
+
+result.cols <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","Shore_dist","Depth_mean","Plant.OCC","Plant.uOCC","Plant.NRG","Plant.H2","Plant.LCOE","Plant.LCOH2","Plant.VIZ.IMP","Plant.FE.IMP","Plant.ML.IMP","Plant.VES.IMP","Plant.SEABED","Plant.OBST","Plant.OBST.Density","Plant.SEABED.Density")  
+
+No.Action.dt <- No.Action.dt[ , ..result.cols]
+# print(object.size(No.Action.dt), units = "MB") #129.1 MB
+
+int.cols <- c("ID","Longitude","Latitude","Bin_lon","Bin_lat","Shore_dist","Depth_mean","Plant.OCC","Plant.NRG","Plant.H2","Plant.uOCC")
+No.Action.dt <- No.Action.dt[ , (int.cols) := lapply(.SD, as.integer),
+                              .SDcols = int.cols]
+  
+# print(object.size(No.Action.dt), units = "MB") #102.7 MB
+
+```
+
+```{r EXECUTE: Execute Final Value Chain Metrics}
+#Loop through data tables
+#Loop through columns to set order
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+Station.keeping <- c("FI","MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+exec.time <- c()
+for(T.S in Turbine.sizes) {
+  start <- Sys.time()
+  for(P.S in Plant.sizes) {
+    
+    My.DTs <- expand.grid(T.S,P.S,Station.keeping,Transmission) 
+    
+    base.dt.name <- paste("T",T.S,".",P.S,".dt",sep = "")
+    base.dt <- get(as.character(base.dt.name))
+    
+    for(i in 1:nrow(My.DTs)) {
+      #get the value chain details
+      this.turb <- My.DTs$Var1[i]
+      this.size <- My.DTs$Var2[i]
+      this.SK <- My.DTs$Var3[i]
+      this.TR <- My.DTs$Var4[i]
+    
+      #get the name of the DT as a character string
+      this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+
+      #Create the new dt
+      this.dt <- Value.Chain.DT(base.dt, SK.type = as.character(this.SK), TR.type = as.character(this.TR), Plant.MW = this.size, Turb.MW = this.turb)
+      
+      #assign the dt to the new object. Should create a new dt
+      assign(this.dt.name, this.dt)
+    
+      }
+    rm(list = c(base.dt.name)) #remove the base dt (T5.100.dt, etc.) to clear up sapce
+  
+    }
+  #timing and monitoring.
+  finish() #tell when the loop has cycled through one turbine size
+  exec.time <- c(exec.time, Sys.time() - start)
+  print(Sys.time() - start)
+}
+
+```
+
+
+
+```{r FUNCTIONS: Get Maximum Value in Columns}
+
+Get.Max <- function(Grid.DTs, Metric) { #expand.grid output, character (in quotes)
+  Max.return <- 0 #reset value
+  Max.DT <- 0 #which DT did the max value come from
+  for(i in 1:nrow(Grid.DTs)) {
+    #get the value chain details
+    this.turb <- My.DTs$Var1[i]
+    this.size <- My.DTs$Var2[i]
+    this.SK <- My.DTs$Var3[i]
+    this.TR <- My.DTs$Var4[i]
+    
+    #get the name of the DT as a character string
+    this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+
+    #Create the new dt
+    this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+    
+    Max <- max(this.dt[[Metric]], na.rm = TRUE)
+    if(Max > Max.return) {
+      Max.return <- Max
+      Max.DT <- this.dt.name
+      }
+  }
+  return(list("Max.Value" = Max.return, 
+              "Source.DT" = Max.DT))#,
+
+}
+
+Get.Min <- function(Grid.DTs, Metric) { #expand.grid output, character (in quotes)
+  Min.return <- 99999999 #reset value
+  Min.DT <- 99999999 #which DT did the Min value come from
+  for(i in 1:nrow(Grid.DTs)) {
+    #get the value chain details
+    this.turb <- My.DTs$Var1[i]
+    this.size <- My.DTs$Var2[i]
+    this.SK <- My.DTs$Var3[i]
+    this.TR <- My.DTs$Var4[i]
+    
+    #get the name of the DT as a character string
+    this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+
+    #Create the new dt
+    this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+    
+    Min <- min(this.dt[[Metric]], na.rm = TRUE)
+    if(Min < Min.return) {
+      Min.return <- Min
+      Min.DT <- this.dt.name
+      }
+  }
+  return(list("Min.Value" = Min.return, 
+              "Source.DT" = Min.DT))#,
+
+}
+
+
+```
+
+
+```{r EXECUTE: Get Maximum Value for Each Metric}
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+Station.keeping <- c("FI","MO")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+Max.OCC <- Get.Max(My.DTs, "Plant.OCC")$Max.Value 
+Max.uOCC <- Get.Max(My.DTs, "Plant.uOCC")$Max.Value
+Max.NRG <- Get.Max(My.DTs, "Plant.NRG")$Max.Value
+Max.H2 <- Get.Max(My.DTs, "Plant.H2")$Max.Value
+Max.LCOE <- Get.Max(My.DTs, "Plant.LCOE")$Max.Value
+Max.LCOH2 <- Get.Max(My.DTs, "Plant.LCOH2")$Max.Value
+Max.VIZ.IMP <- Get.Max(My.DTs, "Plant.VIZ.IMP")$Max.Value
+Max.FE.IMP <- Get.Max(My.DTs, "Plant.FE.IMP")$Max.Value
+Max.ML.IMP <- Get.Max(My.DTs, "Plant.ML.IMP")$Max.Value
+Max.VES.IMP <- Get.Max(My.DTs, "Plant.VES.IMP")$Max.Value
+Max.SEABED <- Get.Max(My.DTs, "Plant.SEABED")$Max.Value
+Max.OBST <- Get.Max(My.DTs, "Plant.OBST")$Max.Value
+Max.OBST.Density <- Get.Max(My.DTs, "Plant.OBST.Density")$Max.Value
+Max.SEABED.Density <- Get.Max(My.DTs, "Plant.SEABED.Density")$Max.Value
+```
+
+
+```{r FUNCTIONS: Normalize Metric Data Tables - Scale Value Chain DTs Function}
+Max.LCOE.2 <- 360 #USD/MWh. According to Lazard 2023, this was the LCOE of utility scale solar in 2009.
+Max.uOCC.2 <- 11000 #USD/kW. According to IRENA 2021, this was the unit cost of CSP in 2011... Note: Max.uOCC is less than this so we do not need to apply this limit.
+
+Normalize.DT <- function(DT.input, Factor = 1, INT = FALSE) { 
+  DT = copy(DT.input) #create a copy
+  if(INT == TRUE) { #turn everything into integers?
+    DT[ , ':=' (Plant.OCC.N = as.integer(Factor - (Factor*Plant.OCC/Max.OCC)),   #min
+                Plant.uOCC.N = as.integer(Factor - (Factor*Plant.uOCC/Max.uOCC)),#min
+                Plant.NRG.N = as.integer(Factor*Plant.NRG/Max.NRG), #max
+                Plant.H2.N = as.integer(Factor*Plant.H2/Max.H2), #max
+                Plant.LCOE.N = as.integer((Factor - as.integer(Factor*Plant.LCOE/Max.LCOE))*(Plant.LCOE != 0)), #min. If this value is equal to zero, we are producing the other energy medium and it should stay zero.
+
+                Plant.LCOE.N2 = as.integer((Factor - as.integer(Factor*Plant.LCOE/Max.LCOE.2))*(Plant.LCOE != 0)), #Method 2. Linear normalization with a set maximum. will produce negative values.
+                Plant.LCOE.N3 = as.integer((Factor - as.integer(Factor*Plant.LCOE/Max.LCOE.2))*(Plant.LCOE != 0)*(Plant.LCOE <= Max.LCOE.2)), #Method 3. Boolean Mask. will just zero out the metric once the cap is reached
+                Plant.LCOH2.N = as.integer((Factor - as.integer(Factor*Plant.LCOH2/Max.LCOH2))*(Plant.LCOH2 != 0)), #min. If this value is equal to zero, we are producing the other energy medium and it should stay zero
+                Plant.VIZ.IMP.N = as.integer(Factor - (Factor*Plant.VIZ.IMP/Max.VIZ.IMP)), #min
+                Plant.FE.IMP.N = as.integer(Factor - (Factor*Plant.FE.IMP/Max.FE.IMP)), #min
+                Plant.ML.IMP.N = as.integer(Factor - (Factor*Plant.ML.IMP/Max.ML.IMP)), #min
+                Plant.VES.IMP.N = as.integer(Factor - (Factor*Plant.VES.IMP/Max.VES.IMP)), #min
+                Plant.SEABED.N = as.integer(Factor - (Factor*Plant.SEABED/Max.SEABED)), #min
+                Plant.OBST.N = as.integer(Factor - (Factor*Plant.OBST/Max.OBST)), #min
+                Plant.SEABED.Density.N = as.integer(Factor - (Factor*Plant.SEABED.Density/Max.SEABED.Density)), #min
+                Plant.OBST.Density.N =  as.integer(Factor - (Factor*Plant.OBST.Density/Max.OBST.Density)))] #min
+  } else {
+    DT[ , ':=' (Plant.OCC.N = Factor - (Factor*Plant.OCC/Max.OCC),
+                Plant.uOCC.N = Factor - (Factor*Plant.uOCC/Max.uOCC),
+                Plant.NRG.N = (Factor*Plant.NRG/Max.NRG),
+                Plant.H2.N = (Factor*Plant.H2/Max.H2),
+                Plant.LCOE.N = (Factor - (Factor*Plant.LCOE/Max.LCOE))*(Plant.LCOE != 0),
+                Plant.LCOE.N2 = (Factor - (Factor*Plant.LCOE/Max.LCOE.2))*(Plant.LCOE != 0), #will produce negative values
+                Plant.LCOE.N3 = (Factor - (Factor*Plant.LCOE/Max.LCOE.2))*(Plant.LCOE != 0)*(Plant.LCOE <= Max.LCOE.2), #Boolean mask
+                Plant.LCOH2.N = (Factor - (Factor*Plant.LCOH2/Max.LCOH2))*(Plant.LCOH2 != 0),
+                Plant.VIZ.IMP.N = Factor - (Factor*Plant.VIZ.IMP/Max.VIZ.IMP),
+                Plant.FE.IMP.N = Factor - (Factor*Plant.FE.IMP/Max.FE.IMP),
+                Plant.ML.IMP.N = Factor - (Factor*Plant.ML.IMP/Max.ML.IMP),
+                Plant.VES.IMP.N = Factor - (Factor*Plant.VES.IMP/Max.VES.IMP),
+                Plant.SEABED.N = Factor - (Factor*Plant.SEABED/Max.SEABED),
+                Plant.OBST.N = Factor - (Factor*Plant.OBST/Max.OBST),
+                Plant.SEABED.Density.N = Factor - (Factor*Plant.SEABED.Density/Max.SEABED.Density),
+                Plant.OBST.Density.N = Factor - (Factor*Plant.OBST.Density/Max.OBST.Density))]
+  }
+
+  return(DT)
+}
+```
+
+```{r EXECUTE: Normalize Metric Data Tables}
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+Station.keeping <- c("FI","MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+No.Action.dt <- Normalize.DT(No.Action.dt, Factor = 1000000, INT = TRUE) #execute for the no action dt separately
+for(i in 1:nrow(My.DTs)) {
+      #get the value chain details
+      this.turb <- My.DTs$Var1[i]
+      this.size <- My.DTs$Var2[i]
+      this.SK <- My.DTs$Var3[i]
+      this.TR <- My.DTs$Var4[i]
+    
+      #get the name of the DT as a character string
+      this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+      this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+      
+      #execute normalization and assign it to the object
+      this.dt <- Normalize.DT(this.dt, Factor = 1000000, INT = TRUE)
+      assign(this.dt.name, this.dt)
+  
+}
+
+finish()
+```
+
+
+```{r Save Turbine and Plant Data Tables - 168 + 1 data tables}
+
+write.csv(No.Action.dt, "~/No.Action.dt.csv")
+
+#Loop through columns to set order
+Plant.sizes <- c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- c(5,8,10,15)
+Station.keeping <- c("FI","MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+for(i in 1:nrow(My.DTs)) {
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+  this.SK <- My.DTs$Var3[i]
+  this.TR <- My.DTs$Var4[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+  
+  #### save the DT
+  this.filepath <- paste("~/",this.dt.name,".csv",sep = "")
+  
+  write.csv(this.dt, this.filepath) #save the csv to the given filepath
+}
+```
+
+
+
+```{r FUNCTIONS: Suitability Scores Function}
+Suitability <- function(weight.list, col.name, LCOE.metric = "Plant.LCOE.N", LCOE.exclusion = FALSE) {
+  metrics <- c("Plant.OCC.N","Plant.uOCC.N","Plant.NRG.N","Plant.H2.N",LCOE.metric,"Plant.LCOH2.N","Plant.VIZ.IMP.N","Plant.FE.IMP.N","Plant.ML.IMP.N","Plant.VES.IMP.N","Plant.SEABED.N","Plant.OBST.N")
+  
+  coeffs <- unlist(weight.list, use.names = FALSE)
+  Factor <- No.Action.dt[1, Plant.OCC.N]
+  max.H2 <- list("Plant.OCC.N" = 1,
+                 "Plant.uOCC.N" = 1,
+                 "Plant.NRG.N" = 0,
+                 "Plant.H2.N" = 1,
+                 LCOE.metric = 0,
+                 "Plant.LCOH2.N" = 1,
+                 "Plant.VIZ.IMP.N" = 1,
+                 "Plant.FE.IMP.N" = 1,
+                 "Plant.ML.IMP.N" = 1,
+                 "Plant.VES.IMP.N" = 1,
+                 "Plant.SEABED.N" = 1,
+                 "Plant.OBST.N" = 1)
+  
+  max.NRG <- list("Plant.OCC.N" = 1,
+                  "Plant.uOCC.N" = 1,
+                  "Plant.NRG.N" = 1,
+                  "Plant.H2.N" = 0,
+                  LCOE.metric = 1,
+                  "Plant.LCOH2.N" = 0,
+                  "Plant.VIZ.IMP.N" = 1,
+                  "Plant.FE.IMP.N" = 1,
+                  "Plant.ML.IMP.N" = 1,
+                  "Plant.VES.IMP.N" = 1,
+                  "Plant.SEABED.N" = 1,
+                  "Plant.OBST.N" = 1)
+  
+  max.NRG.SS <- unlist(max.NRG, use.names = FALSE)%*%coeffs * Factor
+  max.H2.SS <- unlist(max.H2, use.names = FALSE)%*%coeffs * Factor
+  
+  if(max.NRG.SS != max.H2.SS) stop("The chosen weights are invalid")
+  
+  cat("Max Suitability Score =", max.NRG.SS)
+  
+  cont <- readline(prompt = "Continue? (Yes/No): ")
+  
+  if(cont == "No") {
+    message("The execution has been terminated.")
+    return()
+  }
+  
+  col.name <- deparse(substitute(col.name))
+    
+  # suppressWarnings({
+    
+    No.Action.dt[ , (col.name) := as.integer(as.matrix(No.Action.dt[ , ..metrics])%*%coeffs)]
+    
+    Turbine <- c(5,8,10,15)
+    Plant <- c(200,400,600,800,1000,1200,1400)
+    SK <- c("FI","MO","DP")
+    TR <- c("DC","H2")
+    
+    All.DTs <- expand.grid(Turbine,Plant,SK,TR)
+    
+    for(i in 1:nrow(All.DTs)) {
+      #get the name of the DT as a character string
+      this.dt.name <- paste("T",All.DTs$Var1[i],".",All.DTs$Var2[i],".",as.character(All.DTs$Var3[i]),".",as.character(All.DTs$Var4[i]), sep = "")
+      #get the actual dt object
+      this.dt <- get(as.character(this.dt.name))     #this will give an error if the DT is not found
+      
+      
+      if(LCOE.exclusion == TRUE) {
+        #if we apply the LCOE exclusion criteria, if the LCOE metric is zero or negative (corresponding to normalization method 2 and 3 in "Normalize" function), it converts the whole suitability metric to NA.
+        this.dt[ , (col.name) := ifelse(Plant.LCOE.N3 <= 0 & Plant.LCOH2.N <= 0, NA, as.integer(as.matrix(this.dt[ , ..metrics])%*%coeffs))]
+      } else {
+        this.dt[ , (col.name) := as.integer(as.matrix(this.dt[ , ..metrics])%*%coeffs)]
+      }
+      
+      #finally, assign the data generated in this function to the actual dataframe.
+      assign(this.dt.name, this.dt)
+      rm(this.dt)
+
+    }
+  # })
+}
+```
+
+
+
+```{r FUNCTIONS: Distribution of Suitability Scores}
+Scores.vect <- function(Turbine, Plant, SK, TR, col.name, include.NO = TRUE, east.west = FALSE) { #col.name in quotes (character)
+  if(sum(!(Turbine %in% c(5,8,10,15,"All"))) > 0) stop("Please enter valid turbine size(s) or 'All'.")
+  if(sum(!(Plant %in% c(200,400,600,800,1000,1200,1400,"All"))) > 0) stop("Please enter valid plant size(s) or 'All'.")
+  if(sum(!(SK %in% c("FI","MO","DP","All"))) > 0) stop("Please enter a valid station-keeping method or 'All'.")
+  if(sum(!(TR %in% c("DC","H2","All"))) > 0) stop("Please enter a valid transmission method or 'All'.")
+    
+  if(length(Turbine) == 1) {
+    if(Turbine == "All") {Turbine <- c(5,8,10,15)}
+  }  
+  if(length(Plant) == 1) {
+    if(Plant == "All") {Plant <- c(200,400,600,800,1000,1200,1400)}
+  } 
+  if(length(SK) == 1) {
+    if(SK == "All") {SK <- c("FI","MO","DP")}
+  } 
+  if(length(TR) == 1) {
+    if(TR == "All") {TR <- c("DC","H2")}
+  }  
+  
+  All.DTs <- expand.grid(Turbine,Plant,SK,TR)
+
+  result.vect <- c()
+  
+  #first execute for the No.Action.dt
+  if(include.NO == TRUE) {
+    result.vect <- No.Action.dt[[col.name]]
+  }
+  #to loop through each data table
+  for(i in 1:nrow(All.DTs)) {
+    #get the name of the DT as a character string
+    this.dt <- paste("T",All.DTs$Var1[i],".",All.DTs$Var2[i],".",as.character(All.DTs$Var3[i]),".",as.character(All.DTs$Var4[i]), sep = "")
+    #check if the object exists
+    if(exists(as.character(this.dt)) == FALSE) {
+      cat(this.dt)
+      cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+      
+      if(cont == "No") {
+        message("The execution has been terminated.")
+        return()
+      } else {
+        next      #go to the next data table if we decide to continue
+      }
+      
+    }
+    #get the actual dt object
+    this.dt <- get(as.character(this.dt))     #this will give an error if the DT is not found
+    
+    if(east.west != FALSE){ #if only one coast is specified
+      longitude.divide <- -105 #the longitudinal divide. Greater implies east coast, less implies west coast.
+      if(east.west == "East") this.dt <- this.dt[Longitude >= longitude.divide, ]
+      if(east.west == "West") this.dt <- this.dt[Longitude <= longitude.divide, ]
+    }
+    this.vect <- this.dt[[col.name]] #get the scores from this data table
+    
+    result.vect <- c(result.vect, this.vect)
+  }
+  return(result.vect)
+}
+
+```
+
+#Summary Statistics of Raw Plant Metrics For Visualization
+```{r EXECUTE: Distribution of Capital Cost}
+OCC.vect <- Scores.vect('All','All','All','DC',col.name = "Plant.OCC", include.NO = FALSE)
+
+hist(OCC.vect, breaks = "FD", xlab = "Capital Cost [MUSD]", xlim = c(0,10000))#, xlim = c(0,116000)) #116,000 MUSD was the highest paid for an energy project (Oil Exploration)
+boxplot(OCC.vect, horizontal = TRUE, ylim = c(0,116000))
+summary(OCC.vect)
+
+hist(T10.1000.FI.DC$Plant.OCC, breaks = "FD", xlim = c(0,10000))
+hist(T10.1000.FI.H2$Plant.OCC, breaks = "FD", xlim = c(0,10000), col = 'blue')
+
+plot(x = T10.1000.FI.DC$Shore_dist, y = T10.1000.FI.DC$Plant.OCC, pch = 19, cex = 0.5, col = ifelse(T10.1000.FI.DC$Longitude < longitude.divide, 'blue','green' )) #west = blue, east = green
+plot(x = T10.1000.FI.H2$Shore_dist, y = T10.1000.FI.H2$Plant.OCC, pch = 19, cex = 0.5, col = ifelse(T10.1000.FI.H2$Longitude < longitude.divide, 'blue','green' ))
+
+```
+
+
+
+#RESULTS AND VISUALIZATIONS
+```{r FUNCTION: Add Histogram Outline Function}
+Add.Hist.Outline <- function(hist.obj, col.line = 'black') { #input is a histogram object, output will be a line added to an existing graph
+  first.i <- which(hist.obj$counts != 0)[1] #the first nonzero index
+  heights <- hist.obj$counts #all the counts
+  x <- c()
+  y <- c()
+  for(i in first.i:length(heights)){ #if it's the first index, we need to make it drop to zero
+    if(i == first.i) {
+      x <- c(x, hist.obj$breaks[i], hist.obj$breaks[i])
+      y <- c(y, 0, hist.obj$counts[i])
+    } else {
+      x <- c(x, hist.obj$breaks[i], hist.obj$breaks[i])
+      y <- c(y, hist.obj$counts[i-1], hist.obj$counts[i])
+    }
+    if(i == length(heights)) { #if it's the last index, we need to make it drop to zero
+      x <- c(x, hist.obj$breaks[i+1], hist.obj$breaks[i+1])
+      y <- c(y, hist.obj$counts[i], 0)
+    }
+  }
+  lines(x = x, y = y, col = col.line, lty = 1, lwd = 2.5)
+}
+```
+
+
+```{r FUNCTION: Get break points for color coding}
+Breakpoints <- function(vector, quantiles = 10) { #takes vector as an input
+  percentiles <- round(seq(0,100, by = 100/quantiles),1)
+  vector.sort <- sort(vector, na.last = NA) #removes NA values
+  v.len <- length(vector.sort)
+  break.indexes <- seq.int(1, v.len, length.out = length(percentiles))
+  break.values <- vector.sort[break.indexes]
+  break.values[1] <- min(vector, na.rm = TRUE)
+  break.values[length(break.values)] <- max(vector, na.rm = TRUE)
+  result <- data.frame(percentiles, break.values)
+  return(result)
+}
+
+```
+
+##Uniform Weighting
+```{r Suitability Scores - Uniform Weights - All Value Chains, fig.width= 8, fig.asp=0.45}
+unif.weight <- list("w_OCC" = 1,          #minimize. Developer
+                    "w_uOCC" = 1,         #minimize. Developer
+                    "w_NRG" = 1,          #maximize. Developer/Society
+                    "w_H2" = 1,           #maximize. Developer/Society
+                    "w_LCOE" = 1,         #minimize. Developer
+                    "w_LCOH2" = 1,        #minimize. Developer
+                    "w_VIZ.IMP" = 1,      #minimize. Coastal Residents
+                    "w_FE.IMP" = 1,       #minimize. Fisheries
+                    "w_ML.IMP" = 1,       #minimize. Conservationists/Environmentalists
+                    "w_VES.IMP" = 1,      #minimize. Vessel Operators
+                    "w_SEABED" = 1,       #minimize. Conservationists/Environmentalists
+                    "w_OBST" = 1)         #minimize. Conservationists/Environmentalists/Fisheries
+
+Suitability(unif.weight, SS.unif, LCOE.metric = "Plant.LCOE.N3", LCOE.exclusion = TRUE)
+
+SS.unif.vect <- Scores.vect("All","All","All","All", col.name = "SS.unif", include.NO = FALSE)
+SS.total.space <- sum(!is.na(SS.unif.vect)) #72,112,072
+
+Summary.unif <- summary(SS.unif.vect)
+
+Breaks.unif <- Breakpoints(SS.unif.vect, quantiles = 20)
+#Baseline Plants
+SS.unif.vect.east <- Scores.vect(10,1000,"FI","DC", col.name = "SS.unif", include.NO = FALSE, east.west = "East")
+Breaks.unif.base.east <- Breakpoints(SS.unif.vect.east, quantiles = 20)
+
+SS.unif.vect.west <- Scores.vect(10,1000,"MO","DC", col.name = "SS.unif", include.NO = FALSE, east.west = "West")
+Breaks.unif.base.west <- Breakpoints(SS.unif.vect.west, quantiles = 20)
+
+#Across scales
+SS.unif.vect.east <- Scores.vect(10,"All","FI","DC", col.name = "SS.unif", include.NO = FALSE, east.west = "East")
+Breaks.unif.base.east <- Breakpoints(SS.unif.vect.east, quantiles = 20)
+# unif.summary <- boxplot(SS.unif.vect)$stats
+# rownames(unif.summary) <- c("Min","1Q","Median","3Q","Max")
+
+
+```
+
+
+```{r The Effect of Turbine Size - Uniform Weihting}
+SS.unif.No.Action <- unname(summary(No.Action.dt$SS.unif)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.unif.vect_15 <- Scores.vect(Turbine = 15,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.vect_10 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.vect_8 <- Scores.vect(Turbine = 8,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.vect_5 <- Scores.vect(Turbine = 5,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+A <- data.frame('All_Data' = (SS.unif.vect-SS.unif.No.Action)/1000000)
+B <- data.frame('15_MW' = (SS.unif.vect_15-SS.unif.No.Action)/1000000)
+C <- data.frame('10_MW' = (SS.unif.vect_10-SS.unif.No.Action)/1000000)
+D <- data.frame('8_MW' = (SS.unif.vect_8-SS.unif.No.Action)/1000000)
+E <- data.frame('5_MW' = (SS.unif.vect_5-SS.unif.No.Action)/1000000)
+
+boxplot(dplyr::bind_rows(A,B,C,D,E), ylim = c(-5,5), main = "Comparing Turbine Sizes \n(All illustrate 1000 MW Plants, except for the 'All Data' plot)", yaxs = 'i', names = c("All Data","15MW","10MW","8MW","5MW"))
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+```{r Effect of Plant Size}
+SS.unif.100 <- Scores.vect(Turbine = 10,Plant = 100,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+SS.unif.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.unif", include.NO = FALSE)
+
+B <- data.frame('100MW' = (SS.unif.100-SS.unif.No.Action)/1000000)
+C <- data.frame('600MW' = (SS.unif.600-SS.unif.No.Action)/1000000)
+D <- data.frame('1000MW' = (SS.unif.1000-SS.unif.No.Action)/1000000)
+E <- data.frame('1400MW' = (SS.unif.1400-SS.unif.No.Action)/1000000)
+
+boxplot(dplyr::bind_rows(A,E,D,C,B), ylim = c(-5,5), main = "Comparing Plant Sizes \n(All illustrate 10 MW Turbine, except for the 'All Data' plot)", names = c("All Data", "1400MW","1000MW","600MW","100MW"), yaxs = 'i')
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+
+##Developer Skewed Weighting
+```{r Suitability Scores - Developer Skewed Weights 2 - Using Boolean Mask LCOE Normalization}
+dev.weight <- list("w_OCC" = 10/4,          #minimize. Developer
+                   "w_uOCC" = 10/4,         #minimize. Developer
+                   "w_NRG" = 10/4,          #maximize. Developer/Society
+                   "w_H2" = 10/4,           #maximize. Developer/Society
+                   "w_LCOE" = 10/4,         #minimize. Developer
+                   "w_LCOH2" = 10/4,        #minimize. Developer
+                   "w_VIZ.IMP" = 0,      #minimize. Coastal Residents
+                   "w_FE.IMP" = 0,       #minimize. Fisheries
+                   "w_ML.IMP" = 0,       #minimize. Conservationists/Environmentalists
+                   "w_VES.IMP" = 0,      #minimize. Vessel Operators
+                   "w_SEABED" = 0,       #minimize. Conservationists/Environmentalists
+                   "w_OBST" = 0)       #minimize. Conservationists/Environmentalists/Fisheries
+
+Suitability(dev.weight, SS.dev.2, LCOE.metric = "Plant.LCOE.N3", LCOE.exclusion = TRUE)
+
+SS.dev.vect.2 <- Scores.vect("All","All","All","All", col.name = "SS.dev.2", include.NO = FALSE)
+SS.total.space <- sum(!is.na(SS.dev.vect.2)) #72,112,072
+Summary.dev <- summary(SS.dev.vect.2)
+
+Breaks.dev <- Breakpoints(SS.dev.vect.2, quantiles = 20)
+
+#Baseline Plants
+SS.dev.vect.east <- Scores.vect(10,1000,"FI","DC", col.name = "SS.dev.2", include.NO = FALSE, east.west = "East")
+Breaks.dev.base.east <- Breakpoints(SS.dev.vect.east, quantiles = 20)
+
+SS.dev.vect.west <- Scores.vect(10,1000,"MO","DC", col.name = "SS.dev.2", include.NO = FALSE, east.west = "West")
+Breaks.dev.base.west <- Breakpoints(SS.dev.vect.west, quantiles = 20)
+
+#Across scales east
+SS.dev.vect.east <- Scores.vect(10,"All","FI","DC", col.name = "SS.dev.2", include.NO = FALSE, east.west = "East")
+Breaks.dev.base.east <- Breakpoints(SS.dev.vect.east, quantiles = 20)
+
+SS.dev.below <- sum(SS.dev.vect.2[!is.na(SS.dev.vect.2)] <= SS.dev.No.Action) #number of elements below the no action score
+SS.dev.below.share <- SS.dev.below/(length(SS.dev.vect.2[!is.na(SS.dev.vect.2)]))
+SS.dev.above <- sum(SS.dev.vect.2[!is.na(SS.dev.vect.2)] > SS.dev.No.Action)
+SS.dev.above.share <- SS.dev.above/(length(SS.dev.vect.2[!is.na(SS.dev.vect.2)]))
+
+
+length(SS.dev.vect.2[!is.na(SS.dev.vect.2)])
+hist((SS.dev.vect.2-SS.dev.No.Action)/1000000, breaks = "FD", xlim = c(-5,5), main = "Developer Suitability Scores 2 (difference from No Action)", xlab = "Suitability Score Difference")
+abline(v = 0, col = 'red', lwd = 2)
+
+dev.summary <- summary(SS.dev.vect.2)
+
+# Layout to split the screen
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(2,10))
+ 
+
+
+
+```
+
+
+```{r Cape Wind Analysis - Developer Skewed}
+Cape.Wind.VC <- copy(T5.400.FI.DC)
+Cape.Wind.VC <- Cape.Wind.VC[ID %in% Cape_Wind.IDs, ]
+SS.dev.vect.CW <- Cape.Wind.VC$SS.dev
+dev.summary.CW <- summary(Cape.Wind.VC$SS.dev)
+
+# Layout to split the screen
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(2,10))
+ 
+# Draw the boxplot and the histogram 
+par(mar=c(0, 5.5, 0, 1.5))
+boxplot(SS.dev.vect.CW/1000000, horizontal=TRUE, ylim=c(7,9), xaxt="n", outline=FALSE, frame=FALSE)
+#histogram
+par(mar=c(4, 5.5, 0, 1.5))
+options(scipen = 999)
+#show color coded areas for map
+polygon(x = c(dev.summary.CW["Min."],dev.summary.CW["1st Qu."],dev.summary.CW["1st Qu."],dev.summary.CW["Min."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(255/255,0,0,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["1st Qu."],dev.summary.CW["Median"],dev.summary.CW["Median"],dev.summary.CW["1st Qu."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(242/255,131/255,0,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["Median"],dev.summary.CW["3rd Qu."],dev.summary.CW["3rd Qu."],dev.summary.CW["Median"])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(171/255,254/255,4/255,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["3rd Qu."],dev.summary.CW["Max."],dev.summary.CW["Max."],dev.summary.CW["3rd Qu."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(0,254/255,8/255,0.3), lty = 0)
+
+hist(SS.dev.vect.CW/1000000 , breaks=seq(7,9,by=0.025) , col='black' , border=F , main="" , xlab="Developer-Skewed Suitability Score", xlim=c(7,9), las = 1, ylab = "")
+
+polygon(x = c(dev.summary.CW["Min."],dev.summary.CW["1st Qu."],dev.summary.CW["1st Qu."],dev.summary.CW["Min."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(255/255,0,0,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["1st Qu."],dev.summary.CW["Median"],dev.summary.CW["Median"],dev.summary.CW["1st Qu."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(242/255,131/255,0,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["Median"],dev.summary.CW["3rd Qu."],dev.summary.CW["3rd Qu."],dev.summary.CW["Median"])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(171/255,254/255,4/255,0.3), lty = 0)
+polygon(x = c(dev.summary.CW["3rd Qu."],dev.summary.CW["Max."],dev.summary.CW["Max."],dev.summary.CW["3rd Qu."])/1000000,
+        y = c(0,0,8000000,8000000), col = rgb(0,254/255,8/255,0.3), lty = 0)
+
+```
+
+```{r Effect of Turbine Size on Distribution - Developer Skewed Weights}
+SS.dev.No.Action <- unname(summary(No.Action.dt$SS.dev)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.dev.vect_15 <- Scores.vect(Turbine = 15,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.dev", include.NO = FALSE)
+
+SS.dev.vect_10 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.dev", include.NO = FALSE)
+
+SS.dev.vect_8 <- Scores.vect(Turbine = 8,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.dev", include.NO = FALSE)
+
+SS.dev.vect_5 <- Scores.vect(Turbine = 5,Plant = 1000,SK = c("FI","MO"),TR = c("AC"), col.name = "SS.dev", include.NO = FALSE)
+
+A <- data.frame('All_Data' = (SS.dev.vect-SS.dev.No.Action)/1000000)
+B <- data.frame('15_MW' = (SS.dev.vect_15-SS.dev.No.Action)/1000000)
+C <- data.frame('10_MW' = (SS.dev.vect_10-SS.dev.No.Action)/1000000)
+D <- data.frame('8_MW' = (SS.dev.vect_8-SS.dev.No.Action)/1000000)
+E <- data.frame('5_MW' = (SS.dev.vect_5-SS.dev.No.Action)/1000000)
+
+boxplot(dplyr::bind_rows(A,B,C,D,E), ylim = c(-5,5), main = "Comparing Turbine Sizes \n(All illustrate 1000 MW Plants, except for the 'All Data' plot)", yaxs = 'i', names = c("All Data","15MW","10MW","8MW","5MW"))
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+##Stakeholder Skewed
+```{r Suitability Score Results - Stakeholder Skewed Weights}
+stk.weight <- list("w_OCC" = 0,          #minimize. Developer
+                   "w_uOCC" = 0,         #minimize. Developer
+                   "w_NRG" = 10/7,          #maximize. Developer/Society
+                   "w_H2" = 10/7,           #maximize. Developer/Society
+                   "w_LCOE" = 0,         #minimize. Developer
+                   "w_LCOH2" = 0,        #minimize. Developer
+                   "w_VIZ.IMP" = 10/7,      #minimize. Coastal Residents
+                   "w_FE.IMP" = 10/7,       #minimize. Fisheries
+                   "w_ML.IMP" = 10/7,       #minimize. Conservationists/Environmentalists
+                   "w_VES.IMP" = 10/7,      #minimize. Vessel Operators
+                   "w_SEABED" = 10/7,       #minimize. Conservationists/Environmentalists
+                   "w_OBST" = 10/7)       #minimize. Conservationists/Environmentalists/Fisheries
+
+Suitability(stk.weight, SS.stk, LCOE.metric = "Plant.LCOE.N3", LCOE.exclusion = TRUE)
+
+SS.stk.vect <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE)
+SS.total.space <- sum(!is.na(SS.stk.vect)) #76,869,338. 
+
+Breaks.stk <- Breakpoints(SS.stk.vect, quantiles = 20)
+Summary.stk <- summary(SS.stk.vect)
+
+#overall East and West
+SS.stk.vect.east <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE, east.west = "East")
+SS.stk.vect.west <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE, east.west = "West")
+
+Breaks.stk.all.east <- Breakpoints(SS.stk.vect.east, quantiles = 20)
+Breaks.stk.all.weat <- Breakpoints(SS.stk.vect.west, quantiles = 20)
+
+#Baseline Plants
+SS.stk.vect.east <- Scores.vect(10,1000,"FI","DC", col.name = "SS.stk", include.NO = FALSE, east.west = "East")
+Breaks.stk.base.east <- Breakpoints(SS.stk.vect.east, quantiles = 20)
+
+SS.stk.vect.west <- Scores.vect(10,1000,"MO","DC", col.name = "SS.stk", include.NO = FALSE, east.west = "West")
+Breaks.stk.base.west <- Breakpoints(SS.stk.vect.west, quantiles = 20)
+
+#Across scales
+SS.stk.vect.east <- Scores.vect(10,"All","FI","DC", col.name = "SS.stk", include.NO = FALSE, east.west = "East")
+Breaks.stk.base.east <- Breakpoints(SS.stk.vect.east, quantiles = 20)
+
+#number of elements below the no action score
+SS.stk.below <- sum(SS.stk.vect[!is.na(SS.stk.vect)] <= SS.stk.No.Action) 
+SS.stk.below.share <- SS.stk.below/(length(SS.stk.vect[!is.na(SS.stk.vect)]))
+SS.stk.above <- sum(SS.stk.vect[!is.na(SS.stk.vect)] > SS.stk.No.Action)
+SS.stk.above.share <- SS.stk.above/(length(SS.stk.vect[!is.na(SS.stk.vect)]))
+
+##### Visualize the distribution
+summary(SS.stk.vect)
+hist((SS.stk.vect-SS.stk.No.Action)/1000000, breaks = "FD", xlim = c(-5,5), main = "Stakeholder Suitability Scores (difference from No Action)", xlab = "Suitability Score Difference")
+abline(v = 0, col = 'red', lwd = 2)
+
+
+```
+
+
+```{r Effect of Turbine Size on Distribution - Stakeholder Skewed Weights}
+SS.stk.No.Action <- unname(summary(No.Action.dt$SS.stk)[4]) %>% #get the value of No Action
+  as.integer()
+SS.stk.vect_15 <- Scores.vect(Turbine = 15,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+SS.stk.vect_10 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+SS.stk.vect_8 <- Scores.vect(Turbine = 8,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+SS.stk.vect_5 <- Scores.vect(Turbine = 5,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+A <- data.frame('All_Data' = (SS.stk.vect-SS.stk.No.Action)/1000000)
+B <- data.frame('15_MW' = (SS.stk.vect_15-SS.stk.No.Action)/1000000)
+C <- data.frame('10_MW' = (SS.stk.vect_10-SS.stk.No.Action)/1000000)
+D <- data.frame('8_MW' = (SS.stk.vect_8-SS.stk.No.Action)/1000000)
+E <- data.frame('5_MW' = (SS.stk.vect_5-SS.stk.No.Action)/1000000)
+
+boxplot(dplyr::bind_rows(E,D,C,B), ylim = c(-2,2), main = "", yaxs = 'i', names = c("5", "8", "10", "15"), ylab = "Difference from No-Action Score", xlab = "Turbine Size (MW)")
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+```{r Effect of Plant Size - Stakeholder Skewed Weights}
+SS.stk.No.Action <- unname(summary(No.Action.dt$SS.stk)[4]) %>%#get the value of No Action
+  as.integer()
+
+SS.stk.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.stk.vect-SS.stk.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.stk.200-SS.stk.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.stk.400-SS.stk.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.stk.600-SS.stk.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.stk.800-SS.stk.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.stk.1000-SS.stk.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.stk.1200-SS.stk.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.stk.1400-SS.stk.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-2,2), main = "", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "Difference from No-Action Score", xlab = "Plant Size (MW)")
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+##Analysis Results and Visualizations
+```{r VISUALIZE: Boxplots for all normalized scores, fig.width= 12, fig.asp = 0.35}
+#Boxplot
+All <- data.frame(All.OCC,
+                  All.uOCC,
+                  All.LCOE,
+                  All.NRG,
+                  All.VIZ,
+                  All.SEABED,
+                  All.OBST,
+                  All.FE,
+                  All.ML,
+                  All.VES)
+#Main Figure
+b <- boxplot(All/1000000,
+             ylim = c(0,1), main = "", yaxs = 'i', xaxt = 'n', las = 1, outline = FALSE,
+             names = c("Capital\nCost", "Unit Capital\nCost", "Levelized\nCost", "Annual\nEnergy", "Visual\nImpact", "Seabed\nImpact", "Volume\nObstructions", "Fishing\nImpact", "Marine\nBiodiversity", "Vessel\nImpact"), 
+             ylab = "Normalzied Score", xlab = "Criteria")
+axis(side = 1, at = seq_along(b$names), labels = b$names, tick = FALSE)
+
+```
+
+```{r VISUALIZE: Histogram of all alternatives (Manuscript Figure 1)}
+SS.stk.vect <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE)
+SS.stk.vect <- (SS.stk.vect - SS.stk.No.Action)/1000000
+
+SS.stk.vect.east <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE, east.west = "East")
+SS.stk.vect.east <- (SS.stk.vect.east - SS.stk.No.Action)/1000000
+SS.stk.vect.west <- Scores.vect("All","All","All","All", col.name = "SS.stk", include.NO = FALSE, east.west = "West")
+SS.stk.vect.west <- (SS.stk.vect.west - SS.stk.No.Action)/1000000
+
+SS.dev.vect <- Scores.vect("All","All","All","All", col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.vect <- (SS.dev.vect - SS.dev.No.Action)/1000000
+
+SS.dev.vect.east <- Scores.vect("All","All","All","All", col.name = "SS.dev", include.NO = FALSE, east.west = "East")
+SS.dev.vect.east <- (SS.dev.vect.east - SS.dev.No.Action)/1000000
+SS.dev.vect.west <- Scores.vect("All","All","All","All", col.name = "SS.dev", include.NO = FALSE, east.west = "West")
+SS.dev.vect.west <- (SS.dev.vect.west - SS.dev.No.Action)/1000000
+
+#number of elements below the no action score
+SS.stk.below <- sum(SS.stk.vect[!is.na(SS.stk.vect)] <= 0) 
+SS.stk.below.share <- SS.stk.below/(length(SS.stk.vect[!is.na(SS.stk.vect)])) #83%
+SS.stk.above <- sum(SS.stk.vect[!is.na(SS.stk.vect)] > 0)
+SS.stk.above.share <- SS.stk.above/(length(SS.stk.vect[!is.na(SS.stk.vect)])) #17%
+
+SS.dev.below <- sum(SS.dev.vect[!is.na(SS.dev.vect)] <= 0) 
+SS.dev.below.share <- SS.dev.below/(length(SS.dev.vect[!is.na(SS.dev.vect)])) #25%
+SS.dev.above <- sum(SS.dev.vect[!is.na(SS.dev.vect)] > 0)
+SS.dev.above.share <- SS.dev.above/(length(SS.dev.vect[!is.na(SS.dev.vect)])) #75%
+
+#generating histogram data
+hist.stk.ovr <- hist(SS.stk.vect, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, xaxs = 'i', yaxs = 'i', las = 1, ylab = "", border = F, main = "", xlab = "", col=rgb(187/255,187/255,187/255,0.3)) 
+hist.stk.ovr$counts <- hist.stk.ovr$counts/1000
+
+hist.dev.ovr <- hist(SS.dev.vect, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, las = 1, ylab = "", border = F, main = "", xlab = "Suitability Score Difference", col=rgb(255/255,201/255,39/255,0.3), add = TRUE)
+hist.dev.ovr$counts <- hist.dev.ovr$counts/1000
+
+hist.stk.ovreast <- hist(SS.stk.vect.east, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, xaxs = 'i', yaxs = 'i', las = 1, ylab = "", border = F, main = "", xlab = "", col=rgb(187/255,187/255,187/255,0.3)) 
+hist.stk.ovreast$counts <- hist.stk.ovreast$counts/1000
+
+hist.dev.ovreast <- hist(SS.dev.vect.east, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, las = 1, ylab = "", border = F, main = "", xlab = "Suitability Score Difference", col=rgb(255/255,201/255,39/255,0.3), add = TRUE)
+hist.dev.ovreast$counts <- hist.dev.ovreast$counts/1000
+
+hist.stk.ovrwest <- hist(SS.stk.vect.west, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, xaxs = 'i', yaxs = 'i', las = 1, ylab = "", border = F, main = "", xlab = "", col=rgb(187/255,187/255,187/255,0.3)) 
+hist.stk.ovrwest$counts <- hist.stk.ovrwest$counts/1000
+
+hist.dev.ovrwest <- hist(SS.dev.vect.west, breaks = seq(-6,6, by = 0.1), xlim = c(-4,4), plot = F, las = 1, ylab = "", border = F, main = "", xlab = "Suitability Score Difference", col=rgb(255/255,201/255,39/255,0.3), add = TRUE)
+hist.dev.ovrwest$counts <- hist.dev.ovrwest$counts/1000
+
+##Figure 1 plot Overall
+par(mar=c(4, 5.5, 4, 1.5))
+plot(hist.dev.ovr, border = FALSE, col = rgb(253/255, 235/255, 128/255, 0.4), xlab = "", ylab = "", las = 1, xaxs = 'i', yaxs = 'i', xlim = c(-4,4), ylim = c(0,12000))
+Add.Hist.Outline(hist.dev.ovr, col.line = "#daca6e")
+plot(hist.stk.ovr, border = FALSE, col = rgb(126/255, 234/255, 255/255, 0.4), add = TRUE)
+Add.Hist.Outline(hist.stk.ovr, col.line = "#61b5c4")
+abline(v = 0, col = 'red', lwd = 2)
+axis(1)
+text(x = -1, y = 6000, label = "83%", col = "#61b5c4", cex = 1.4)
+text(x = 0.4, y = 6000, label = "17%", col = "#61b5c4", cex = 1.4)
+
+text(x = -0.5, y = 2000, label = "25%", col = "#daca6e", cex = 1.4)
+text(x = 2, y = 2000, label = "75%", col = "#daca6e", cex = 1.4)
+mtext("Number of Alternatives (in Thousands)",side = 2, line = 3.5)
+mtext("Suitability Score Difference", side = 1, line = 2)
+legend('topright', legend = c("Developer Suitability Score", "Stakeholder Suitability Score", "No Action Score"), col = c("#daca6e", "#61b5c4", 'red'), lty = 1, lwd = 3, cex = 0.8)
+```
+
+
+```{r VALIDATE: Existing Project Proposals}
+
+Lease.Areas <- read.csv("~/BOEM Lease Area IDs.csv") %>%
+  rename(Humboldt = ï..Humboldt)
+
+Cape_Wind.IDs <- Lease.Areas$Cape.Wind[!is.na(Lease.Areas$Cape.Wind)]
+Vineyard.IDs <- Lease.Areas$OCS.A0501[!is.na(Lease.Areas$OCS.A0501)]
+Mayflower.IDs <- Lease.Areas$OCS.A0521[!is.na(Lease.Areas$OCS.A0521)]
+South_Fork.IDs <- Lease.Areas$OCS.A0517[!is.na(Lease.Areas$OCS.A0517)]
+New_England.IDs <- Lease.Areas$OCS.A0534[!is.na(Lease.Areas$OCS.A0534)]
+CVOW.IDs <- Lease.Areas$OCS.A0483[!is.na(Lease.Areas$OCS.A0483)]
+Sunrise.IDs <- Lease.Areas$OCS.A0487[!is.na(Lease.Areas$OCS.A0487)]
+Kitty_Hawk.IDs <- Lease.Areas$OCS.A0508[!is.na(Lease.Areas$OCS.A0508)]
+Empire.IDs <- Lease.Areas$OCS.A0512[!is.na(Lease.Areas$OCS.A0512)]
+
+Cape_Wind.dt <- T5.400.FI.DC[ID %in% Cape_Wind.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                      mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                      mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                      mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+Vineyard.dt <- T15.800.FI.DC[ID %in% Vineyard.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                     mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                     mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                     mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+Mayflower.dt <- T15.800.FI.DC[ID %in% Mayflower.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                       mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                       mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                       mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+South_Fork.dt <- T15.200.FI.DC[ID %in% South_Fork.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                        mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                        mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                        mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+New_England.dt <- T15.1400.FI.DC[ID %in% New_England.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                            mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                            mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                            mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+CVOW.dt <- T15.1400.FI.DC[ID %in% CVOW.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                              mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                              mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                              mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+Sunrise.dt <- T10.1000.FI.DC[ID %in% Sunrise.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                    mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                    mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                    mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+Kitty_Hawk.dt <- T15.1000.FI.DC[ID %in% Kitty_Hawk.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                          mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                          mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                          mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+Empire.dt <- T15.1400.FI.DC[ID %in% Empire.IDs, .(mean_dist = mean(Shore_dist, na.rm = TRUE),
+                                                  mean_SS.unif = (mean(SS.unif, na.rm = TRUE) - SS.unif.No.Action)/1000000,
+                                                  mean_SS.dev = (mean(SS.dev.2, na.rm = TRUE) - SS.dev.No.Action)/1000000,
+                                                  mean_SS.stk = (mean(SS.stk, na.rm = TRUE) - SS.stk.No.Action)/1000000)]
+
+```
+
+
+```{r Effect of Plant Size - Developer vs Stakeholder Weights, fig.width= 12, fig.asp=0.3}
+#Developer Weight Details by size
+SS.dev.No.Action <- unname(summary(No.Action.dt$SS.dev.2)[4]) %>%#get the value of No Action
+  as.integer()
+
+SS.dev.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.dev.vect-SS.dev.No.Action)/1000000)
+B <- data.frame(Score = (SS.dev.200-SS.dev.No.Action)/1000000, Size = "200", Paradigm = "Developer")
+C <- data.frame(Score = (SS.dev.400-SS.dev.No.Action)/1000000, Size = "400", Paradigm = "Developer")
+D <- data.frame(Score = (SS.dev.600-SS.dev.No.Action)/1000000, Size = "600", Paradigm = "Developer")
+E <- data.frame(Score = (SS.dev.800-SS.dev.No.Action)/1000000, Size = "800", Paradigm = "Developer")
+G <- data.frame(Score = (SS.dev.1000-SS.dev.No.Action)/1000000, Size = "1000", Paradigm = "Developer")
+H <- data.frame(Score = (SS.dev.1200-SS.dev.No.Action)/1000000, Size = "1200", Paradigm = "Developer")
+I <- data.frame(Score = (SS.dev.1400-SS.dev.No.Action)/1000000, Size = "1400", Paradigm = "Developer")
+
+Size.data <- dplyr::bind_rows(B,C,D,E,G,H,I)
+
+#Stakeholder weight details by size
+SS.stk.No.Action <- unname(summary(No.Action.dt$SS.stk)[4]) %>%#get the value of No Action
+  as.integer()
+
+SS.stk.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.stk.vect-SS.stk.No.Action)/1000000)
+B <- data.frame(Score = (SS.stk.200-SS.stk.No.Action)/1000000, Size = "200", Paradigm = "Stakeholder")
+C <- data.frame(Score = (SS.stk.400-SS.stk.No.Action)/1000000, Size = "400", Paradigm = "Stakeholder")
+D <- data.frame(Score = (SS.stk.600-SS.stk.No.Action)/1000000, Size = "600", Paradigm = "Stakeholder")
+E <- data.frame(Score = (SS.stk.800-SS.stk.No.Action)/1000000, Size = "800", Paradigm = "Stakeholder")
+G <- data.frame(Score = (SS.stk.1000-SS.stk.No.Action)/1000000, Size = "1000", Paradigm = "Stakeholder")
+H <- data.frame(Score = (SS.stk.1200-SS.stk.No.Action)/1000000, Size = "1200", Paradigm = "Stakeholder")
+I <- data.frame(Score = (SS.stk.1400-SS.stk.No.Action)/1000000, Size = "1400", Paradigm = "Stakeholder")
+
+Size.data <- dplyr::bind_rows(Size.data,B,C,D,E,G,H,I)
+Size.data$Size <- factor(Size.data$Size, levels = c("200","400","600","800","1000","1200","1400"))
+
+## Plot
+library(ggplot2)
+theme_gray() # the default theme
+### Use this to make it look like base
+theme_set(theme_bw())
+theme_update(text = element_text(size=12),
+panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(),
+strip.background = element_blank()
+)
+ggplot(Size.data, aes(x = Size, y = Score, fill = Paradigm)) +
+  geom_boxplot(outlier.size = 1, outlier.shape = NA) + 
+  scale_fill_manual(values=c("#fdeb80","#61b5c4")) +
+  labs(x = "Plant Size (MW)", y = "Suitability Score Difference") +
+  geom_hline(yintercept = 0, color = 'red', size = 1.25)
+
+
+# ggsave(q, filename = "theme_gray.png", device="png", width=4, height=3)
+```
+
+
+```{r Effect of Plant Size - Developer vs Stakeholder Weights Histograms, fig.width= 10, fig.asp=0.35}
+#Histograms #200 MW
+hist.dev.200 <- hist((SS.dev.200-SS.dev.No.Action)/1000000, plot = FALSE)
+hist.stk.200 <- hist((SS.stk.200-SS.stk.No.Action)/1000000, plot = FALSE)
+hist.dev.200$counts <- hist.dev.200$counts/1000
+hist.stk.200$counts <- hist.stk.200$counts/1000
+
+plot(hist.dev.200, border = FALSE, col = rgb(253/255, 235/255, 128/255, 0.4), xlab = "", ylab = "", las = 1, xaxs = 'i', yaxs = 'i', xlim = c(-4,4), ylim = c(0,80))
+Add.Hist.Outline(hist.dev.200, col.line = "#daca6e")
+plot(hist.stk.200, border = FALSE, col = rgb(126/255, 234/255, 255/255, 0.4), add = TRUE)
+Add.Hist.Outline(hist.stk.200, col.line = "#61b5c4")
+abline(v = 0, col = 'red', lwd = 2)
+legend('topright', legend = c("Developer Suitability Score", "Stakeholder Suitability Score", "No Action Score"), col = c("#daca6e", "#61b5c4", 'red'), lty = 1, lwd = 3, cex = 0.8)
+text(x = -3, y = 60, label = "200 MW Plant", col = "black", cex = 1.4)
+text(x = 2.5, y = 500, label = "48%", col = "#daca6e", cex = 1.4)
+mtext("Number of Alternatives (in Thousands)",side = 2, line = 3)
+mtext("Suitability Score Difference", side = 1, line = 2)
+
+#Histograms 1400 MW
+hist.dev.1400 <- hist((SS.dev.1400-SS.dev.No.Action)/1000000, plot = FALSE)
+hist.stk.1400 <- hist((SS.stk.1400-SS.stk.No.Action)/1000000, plot = FALSE)
+hist.dev.1400$counts <- hist.dev.1400$counts/1000
+hist.stk.1400$counts <- hist.stk.1400$counts/1000
+
+plot(hist.dev.1400, border = FALSE, col = rgb(253/255, 235/255, 128/255, 0.4), xlab = "", ylab = "", las = 1, xaxs = 'i', yaxs = 'i', xlim = c(-4,4), ylim = c(0,80))
+Add.Hist.Outline(hist.dev.1400, col.line = "#daca6e")
+plot(hist.stk.1400, border = FALSE, col = rgb(126/255, 234/255, 255/255, 0.4), add = TRUE)
+Add.Hist.Outline(hist.stk.1400, col.line = "#61b5c4")
+abline(v = 0, col = 'red', lwd = 2)
+legend('topright', legend = c("Developer Suitability Score", "Stakeholder Suitability Score", "No Action Score"), col = c("#daca6e", "#61b5c4", 'red'), lty = 1, lwd = 3, cex = 0.8)
+text(x = -3, y = 60, label = "1,400 MW Plant", col = "black", cex = 1.4)
+text(x = 2.5, y = 500, label = "48%", col = "#daca6e", cex = 1.4)
+mtext("Frequency (in Thousands)",side = 2, line = 3)
+mtext("Suitability Score Difference", side = 1, line = 2)
+
+
+
+```
+
+
+```{r EXECUTE: Histogram of plant size scores}
+options(scipen = 999)
+hist200 <- hist(SS.stk.200/1000000 , breaks=seq(0,10,by=0.25) , col=rgb(187/255,187/255,187/255,0.3) , border=F , main="" , xlab="Suitability Score", xlim=c(4,9), las = 1, ylab = "")
+Add.Hist.Outline(hist200, col.line = rgb(187/255,187/255,187/255,1))
+hist1400 <- hist(SS.stk.1400/1000000 , breaks=seq(0,10,by=0.25) , col=rgb(255/255,201/255,39/255,0.3) , border=F , main="" , xlab="Suitability Score", xlim=c(4,9), las = 1, ylab = "", add = TRUE)
+Add.Hist.Outline(hist1400, col.line = rgb(255/255,201/255,39/255,1))
+
+
+#visualize different metrics
+
+Histograms.Sizes <- function(metric, x.lab, x.min = 0, x.lim = 1, plant.A = 200, plant.B = 1400, turbine.size = 10,nbreaks = 100) { #takes input as the metric and the two plant sizes you're comparing
+  
+  vect.A <- Scores.vect(Turbine = turbine.size,Plant = plant.A,SK = c("FI"),TR = c("DC"), col.name = metric, include.NO = FALSE)
+  vect.B <- Scores.vect(Turbine = turbine.size,Plant = plant.B,SK = c("FI"),TR = c("DC"), col.name = metric, include.NO = FALSE)
+  
+  max.counts.A <- max(c(hist(vect.A/1000000, breaks=100, plot = FALSE)$counts)) %>%
+    round(-3)
+  max.counts.B <- max(c(hist(vect.B/1000000, breaks=100, plot = FALSE)$counts)) %>%
+    round(-3)
+  
+  #visualize distribution. Plot the one with more counts first to set the y axis.
+  options(scipen = 999)
+  windows.options (width = 10, height = 3) 
+  
+  
+  if(max.counts.A > max.counts.B){
+    histA <- hist(vect.A/1000000 , breaks=nbreaks , col=rgb(27/255,57/255,255/255,0.45) , border=rgb(27/255,57/255,255/255,0.45) , main = "", xlab=x.lab, xlim=c(x.min,x.lim), las = 1, ylab = "") #blue
+    Add.Hist.Outline(histA, col.line = rgb(27/255,57/255,255/255,1))
+    histB <- hist(vect.B/1000000 , breaks=nbreaks , col=rgb(252/255,150/255,17/255,0.45) , border=rgb(252/255,150/255,17/255,0.45), main = "", xlab="", xlim=c(x.min,x.lim), las = 1, ylab = "", add = TRUE) #orange
+    Add.Hist.Outline(histB, col.line = rgb(252/255,150/255,17/255,1))
+    # legend('topleft', legend = c("200MW","1400MW"), col = c(rgb(27/255,57/255,255/255),rgb(252/255,150/255,17/255)), lty = 1, lwd = 2)
+  } else {
+    histB <- hist(vect.B/1000000 , breaks=nbreaks , col=rgb(252/255,150/255,17/255,0.45) , border=rgb(252/255,150/255,17/255,0.45), main="" , xlab=x.lab, xlim=c(x.min,x.lim), las = 1, ylab = "") #orange
+    Add.Hist.Outline(histB, col.line = rgb(252/255,150/255,17/255,1))
+    histA <- hist(vect.A/1000000 , breaks=nbreaks, col=rgb(27/255,57/255,255/255,0.45) , border=rgb(27/255,57/255,255/255,0.45), main="" , xlab="", xlim=c(x.min,x.lim), las = 1, ylab = "", add = TRUE) #blue
+    Add.Hist.Outline(histA, col.line = rgb(27/255,57/255,255/255,1))
+    
+    # legend('topleft', legend = c("200MW","1400MW"), col = c(rgb(27/255,57/255,255/255),rgb(252/255,150/255,17/255)), lty = 1, lwd = 2)
+  }
+  
+}
+```
+
+```{r EXECUTE: Distribution of the normalized scores, fig.height = 8, fig.asp = 0.35}
+# Histograms.Sizes("Plant.OCC.N")
+# Histograms.Sizes("Plant.uOCC.N")
+Histograms.Sizes("Plant.NRG.N", "Normalized Annual Energy Generation",nbreaks=20)
+Histograms.Sizes("Plant.VIZ.IMP.N", "Normalized Visual Impact", nbreaks = 20)
+Histograms.Sizes("Plant.FE.IMP.N", "Normalized Fishing Impact",nbreaks = 50)
+Histograms.Sizes("Plant.ML.IMP.N", "Normalized Marine Biodiversity Impact",nbreaks=50)
+Histograms.Sizes("Plant.VES.IMP.N", "Normalized Vessel Traffic Impact")
+Histograms.Sizes("Plant.SEABED.N", "Normalized Seabed Impact")
+Histograms.Sizes("Plant.OBST.N", "Normalized Ocean Obstructions")
+Histograms.Sizes("Plant.LCOE.N3", "Normalized Levelized Cost of Electricity",nbreaks = 20)
+Histograms.Sizes("Plant.OCC.N", "Normalized Overnight Capital Cost", nbreaks=50)
+Histograms.Sizes("Plant.uOCC.N", "Normalized Unit Capital Cost",nbreaks = 50)
+
+#OVERALL SUITABILITY
+Histograms.Sizes("SS.stk","Overall Suitability Score", x.min = 4, x.lim = 10, turbine.size = 15)
+abline(v = SS.stk.No.Action/1000000, col = 'red', lwd = 2)
+
+Histograms.Sizes("SS.dev","Overall Suitability Score", x.min = 4, x.lim = 10, turbine.size = 15)
+abline(v = SS.dev.No.Action/1000000, col = 'red', lwd = 2)
+
+Histograms.Sizes("SS.unif","Overall Suitability Score", x.min = 4, x.lim = 10, turbine.size = 10)
+abline(v = SS.unif.No.Action/1000000, col = 'red', lwd = 2)
+```
+
+
+
+
+```{r EXECUTE: Get breakpoints for several value chains, fig.asp = 0.45}
+Figure.Vector <- c(T10.200.FI.DC[ , SS.stk], 
+                   T10.400.FI.DC[ , SS.stk], 
+                   T10.600.FI.DC[ , SS.stk],
+                   T10.800.FI.DC[ , SS.stk],
+                   T10.1000.FI.DC[ , SS.stk],
+                   T10.1200.FI.DC[ , SS.stk],
+                   T10.1400.FI.DC[ , SS.stk])
+
+Stk.breaks.T10 <- Breakpoints(Figure.Vector)
+Col.bands <- (Stk.breaks.T10$break.values - SS.stk.No.Action)/1000000
+
+#plot histograms with colored bands
+B <- data.frame('200MW' = (SS.stk.200-SS.stk.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.stk.400-SS.stk.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.stk.600-SS.stk.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.stk.800-SS.stk.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.stk.1000-SS.stk.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.stk.1200-SS.stk.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.stk.1400-SS.stk.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-2,2), main = "", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "", cex = 0.3)
+mtext("Difference from \nNo-Action Score", side = 2, line = 2)
+mtext("Plant Size (MW)", side = 1, line = 1.75)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[1],Col.bands[1], Col.bands[2], Col.bands[2]), col = rgb(255/255,1/255,0/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[2],Col.bands[2], Col.bands[3], Col.bands[3]), col = rgb(255/255,55/255,10/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[3],Col.bands[3], Col.bands[4], Col.bands[4]), col = rgb(255/255,108/255,20/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[4],Col.bands[4], Col.bands[5], Col.bands[5]), col = rgb(255/255,162/255,31/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[5],Col.bands[5], Col.bands[6], Col.bands[6]), col = rgb(255/255,215/255,41/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[6],Col.bands[6], Col.bands[7], Col.bands[7]), col = rgb(236/255,249/255,50/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[7],Col.bands[7], Col.bands[8], Col.bands[8]), col = rgb(189/255,250/255,59/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[8],Col.bands[8], Col.bands[9], Col.bands[9]), col = rgb(142/255,252/255,68/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[9],Col.bands[9], Col.bands[10], Col.bands[10]), col = rgb(94/255,253/255,76/255,0.45), border = NA)
+polygon(x = c(0,2000,2000,0), y = c(Col.bands[10],Col.bands[10], Col.bands[11], Col.bands[11]), col = rgb(47/255,255/255,85/255,0.45), border = NA)
+abline(h = 0, col = 'black', lwd = 1, lty = 2)
+```
+
+
+
+```{r}
+Histograms.Tech <- function(metric, x.lab, x.min = 0, x.lim = 10, y.lim = FALSE, DP = TRUE, H2 = TRUE, BOTH = TRUE, turbine.size = 10, plant.size = 1000, legend = FALSE) { #takes input as the metric and the two plant sizes you're comparing
+  
+  vect.Base <- Scores.vect(Turbine = turbine.size,Plant = plant.size,SK = "MO",TR = "DC", col.name = metric, include.NO = FALSE)
+  mean.Base <- round(mean(vect.Base, na.rm = TRUE)/1000000,2) #get the mean
+  count.Base <- sum(!is.na(vect.Base)) #get the number of alternatives
+  
+  vect.DP <- Scores.vect(Turbine = turbine.size,Plant = plant.size,SK = "DP",TR = "DC", col.name = metric, include.NO = FALSE)
+  mean.DP <- round(mean(vect.DP, na.rm = TRUE)/1000000,2) #get the mean
+  count.DP <- sum(!is.na(vect.DP)) #get the number of alternatives
+  
+  vect.H2 <- Scores.vect(Turbine = turbine.size,Plant = plant.size,SK = "MO",TR = "H2", col.name = metric, include.NO = FALSE)
+  mean.H2 <- round(mean(vect.H2, na.rm = TRUE)/1000000,2) #get the mean
+  count.H2 <- sum(!is.na(vect.H2)) #get the number of alternatives
+  
+  vect.All <- Scores.vect(Turbine = turbine.size,Plant = plant.size,SK = "DP",TR = "H2", col.name = metric, include.NO = FALSE)
+  mean.All <- round(mean(vect.All, na.rm = TRUE)/1000000,2) #get the mean
+  count.All <- sum(!is.na(vect.All)) #get the number of alternatives
+  
+  if(y.lim == FALSE) { #if a y-limit is not chosen on our own, then use the max counts to choose one.
+    max.counts <- max(hist(vect.All/1000000, breaks=seq(0,x.lim,by=x.lim/100), plot = FALSE)$counts) %>%
+      round(-3)
+  } else {
+    max.counts <- y.lim
+  }
+  
+
+  #visualize distribution. Plot the one with more counts first to set the y axis.
+  options(scipen = 999)
+  hist.base <- hist(vect.Base/1000000,breaks=seq(0,x.lim,by=x.lim/100), col=rgb(27/255,57/255,255/255,0.2), border = F, main = "", xlab=x.lab, xlim = c(x.min,x.lim), ylim=c(0,max.counts), las = 1, ylab = "") #blue
+  Add.Hist.Outline(hist.base, col.line = rgb(27/255,57/255,255/255,1))
+  
+  if(DP == TRUE) {
+    hist.DP <- hist(vect.DP/1000000, breaks=seq(0,x.lim,by=x.lim/100), col=rgb(252/255,150/255,17/255,0.2), border = F, main = "", xlab=x.lab, xlim = c(x.min,x.lim), las = 1, ylab = "", add = TRUE)
+    Add.Hist.Outline(hist.DP, col.line = rgb(252/255,150/255,17/255,1))
+  }
+  if(H2 == TRUE) {
+    hist.H2 <- hist(vect.H2/1000000, breaks=seq(0,x.lim,by=x.lim/100), col=rgb(126/255,126/255,126/255,0.2), border = F, main = "", xlab=x.lab, xlim = c(x.min,x.lim), las = 1, ylab = "", add = TRUE)
+    Add.Hist.Outline(hist.H2, col.line = rgb(126/255,126/255,126/255,1))
+  }
+  if(BOTH == TRUE) {
+    hist.All <- hist(vect.All/1000000, breaks=seq(0,x.lim,by=x.lim/100), col=rgb(227/255,74/255,217/255,0.2), border = F, main = "", xlab=x.lab, xlim = c(x.min,x.lim), las = 1, ylab = "", add = TRUE)
+    Add.Hist.Outline(hist.All, col.line = rgb(227/255,74/255,217/255,1))
+  }
+  
+
+  if(legend == TRUE) {
+    Base.legend <- paste("Base: MO+DC ","(",count.Base,"; ",mean.Base,")", sep = "") 
+    DP.legend <- paste("DP: DP+DC ","(",count.DP,"; ",mean.DP,")", sep = "") 
+    H2.legend <- paste("H2: MO+H2 ","(",count.H2,"; ",mean.H2,")", sep = "")
+    Both.legend <- paste("Both: DP+H2 ","(",count.All,"; ",mean.All,")", sep = "") 
+    legend('topleft', title = "Value Chain (# alternatives; mean)",
+           legend = c(Base.legend,DP.legend,H2.legend,Both.legend), 
+           col = c(rgb(27/255,57/255,255/255), 
+                   rgb(252/255,150/255,17/255),
+                   rgb(126/255,126/255,126/255),
+                   rgb(227/255,74/255,217/255)), lty = 1, lwd = 2, cex = 0.8)
+  }
+}
+```
+
+
+```{r FUNCTIONS: Add Geometries to the dataframes}
+library(sf)
+
+NA.grid <- read_sf(dsn = "~", layer = "2x2_Full Dataset")
+NA.grid.key <- NA.grid[ , c("id","geometry")]
+# setnames(NA.grid.key, c("id"), c("ID"))
+rm(NA.grid)
+
+Add.Geometry <- function(DT, key.dt = NA.grid.key,
+                         col.merge = c("ID","Depth_mean","Plant.OCC.N","Plant.uOCC.N","Plant.NRG.N","Plant.H2.N","Plant.LCOE.N","Plant.LCOH2.N","Plant.VIZ.IMP.N","Plant.FE.IMP.N","Plant.ML.IMP.N","Plant.VES.IMP.N","Plant.SEABED.N","Plant.OBST.N","Plant.SEABED.Density.N","Plant.OBST.Density.N","SS.unif","SS.dev","SS.stk","SS.dev.2"),
+                         old.names = c("id","Depth_mean","Plant.OCC.N","Plant.uOCC.N","Plant.NRG.N","Plant.H2.N","Plant.LCOE.N","Plant.LCOH2.N","Plant.VIZ.IMP.N","Plant.FE.IMP.N","Plant.ML.IMP.N","Plant.VES.IMP.N","Plant.SEABED.N","Plant.OBST.N","Plant.SEABED.Density.N","Plant.OBST.Density.N","SS.unif","SS.dev","SS.stk","SS.dev.2"),
+                         new.names = c("ID","DEPTH","OCC","uOCC","NRG","H2","LCOE","LCOH2","VIZ_IMP","FE_IMP","ML_IMP","VES_IMP","SEABED","OBST","SEABED_D","OBST_D","SS_unif","SS_dev","SS_stk","SS_dev2")) {
+  
+  if(length(old.names) != length(new.names)) stop("Check column names.")
+
+  #attach sf object type details and convert the DT to an sf object type.
+  DT.sf <- merge(key.dt, DT[ ,..col.merge], by.x = "id", by.y = "ID", all = TRUE)
+  
+  #rename the columns so they fit (shapefiles can only have short names)
+  setnames(DT.sf, old = old.names, new = new.names)
+  return(DT.sf)
+}
+
+```
+
+
+```{r EXECUTE: Add Geometries, Convert to Shapefiles, and Save as Shapefiles to external SSD}
+#execute the following for loop for the No Action value chain
+No.Action.dt.sf <- Add.Geometry(No.Action.dt)
+st_write(No.Action.dt.sf, "~/No.Action.dt.shp", append = FALSE)
+rm(No.Action.dt.sf)
+
+#Loop through columns to set order
+Plant.sizes <- c(200,1000,1400)#c(200,400,600,800,1000,1200,1400)
+Turbine.sizes <- 10#c(5,8,10,15)
+Station.keeping <- c("FI","MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+for(i in 1:nrow(My.DTs)) {
+  #get the name of the DT as a character string
+  this.dt.str <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".",as.character(My.DTs$Var3[i]),".",as.character(My.DTs$Var4[i]), sep = "")
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.str))     #this will give an error if the DT is not found
+  
+  #attach shapefile polygons and convert to a shapefile
+  this.sf <- Add.Geometry(this.dt)
+  #assemble the filepath where to save this sf.
+  file.path.sf <- paste("~/",as.character(this.dt.str),".shp", sep = "")
+  #save the sf object type to the file.path (external SSD)
+  st_write(this.sf, file.path.sf, append = FALSE)
+  #remove the sf to save space
+  rm(this.sf)
+  #optional - remove the data.table as well to save some space
+  # rm(this.dt)
+  print(i)
+}
+
+
+```
+
+
+```{r EXECUTE: Get Breakpoints of Baseline Value Chain for Visualization}
+#East Coast - Fixed Foundations
+Baseline.unif <- T10.1000.FI.DC[ , SS.unif]
+Unif.breaks <- Breakpoints(Baseline.unif)
+Baseline.dev <- T10.1000.FI.DC[ , SS.dev.2]
+Dev.breaks <- Breakpoints(Baseline.dev)
+Baseline.stk <- T10.1000.FI.DC[ , SS.stk]
+Stk.breaks <- Breakpoints(Baseline.stk)
+
+#West Coast - Moored Foundations
+Baseline.unif <- T10.1000.MO.DC[ , SS.unif]
+Unif.breaks <- Breakpoints(Baseline.unif)
+Baseline.dev <- T10.1000.MO.DC[ , SS.dev.2]
+Dev.breaks <- Breakpoints(Baseline.dev)
+Baseline.stk <- T10.1000.MO.DC[ , SS.stk]
+Stk.breaks <- Breakpoints(Baseline.stk)
+
+#DP Foundations
+Baseline.unif <- T10.1000.DP.DC[ , SS.unif]
+Unif.breaks <- Breakpoints(Baseline.unif)
+Baseline.dev <- T10.1000.DP.DC[ , SS.dev.2]
+Dev.breaks <- Breakpoints(Baseline.dev)
+Baseline.stk <- T10.1000.DP.DC[ , SS.stk]
+Stk.breaks <- Breakpoints(Baseline.stk)
+```
+
+
+
+#Other Weight Profiles
+```{r Suitability Score Results - High Concern Skewed Weights, fig.width= 8, fig.asp=0.45}
+hcs.weight <- list("w_OCC" = 0,          
+                   "w_uOCC" = 0,         
+                   "w_NRG" = 4,          
+                   "w_H2" = 4,           
+                   "w_LCOE" = 0,         
+                   "w_LCOH2" = 0,        
+                   "w_VIZ.IMP" = 1,      
+                   "w_FE.IMP" = 1,       
+                   "w_ML.IMP" = 1,       
+                   "w_VES.IMP" = 1,      
+                   "w_SEABED" = 1,       
+                   "w_OBST" = 1)       
+
+Suitability(hcs.weight, SS.hcs, LCOE.exclusion = TRUE)
+
+SS.hcs.No.Action <- unname(summary(No.Action.dt$SS.hcs)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.hcs.vect <- Scores.vect("All","All","All","All", col.name = "SS.hcs", include.NO = FALSE)
+
+SS.hcs.below <- sum(SS.hcs.vect[!is.na(SS.hcs.vect)] <= SS.hcs.No.Action) #number of elements below the no action score
+SS.hcs.below.share <- SS.hcs.below/(length(SS.hcs.vect[!is.na(SS.hcs.vect)]))
+SS.hcs.above <- sum(SS.hcs.vect[!is.na(SS.hcs.vect)] > SS.hcs.No.Action)
+SS.hcs.above.share <- SS.hcs.above/(length(SS.hcs.vect[!is.na(SS.hcs.vect)]))
+
+##### Visualize the distribution
+summary(SS.hcs.vect)
+hist((SS.hcs.vect-SS.hcs.No.Action)/1000000, breaks = "FD", xlim = c(-5,5), main = "High Concern Suitability Scores (difference from No Action)", xlab = "Suitability Score Difference")
+abline(v = 0, col = 'red', lwd = 2)
+
+hcs.summary <- summary(SS.hcs.vect)
+
+
+
+### Effect of Plant Size
+SS.hcs.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+SS.hcs.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.hcs", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.hcs.vect-SS.hcs.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.hcs.200-SS.hcs.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.hcs.400-SS.hcs.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.hcs.600-SS.hcs.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.hcs.800-SS.hcs.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.hcs.1000-SS.hcs.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.hcs.1200-SS.hcs.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.hcs.1400-SS.hcs.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-3,3), main = "High Concern Boxplots", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "Plant Size (MW)")
+mtext("Difference from\nNo-Action Score", side = 2, line = 2)
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+```{r Suitability Score Results - Low Concern Skewed Weights, fig.width= 8, fig.asp=0.45}
+lcs.weight <- list("w_OCC" = 0,          
+                   "w_uOCC" = 0,         
+                   "w_NRG" = 0.5,          
+                   "w_H2" = 0.5,           
+                   "w_LCOE" = 0,         
+                   "w_LCOH2" = 0,        
+                   "w_VIZ.IMP" = 9.5/6,      
+                   "w_FE.IMP" = 9.5/6,       
+                   "w_ML.IMP" = 9.5/6,       
+                   "w_VES.IMP" = 9.5/6,      
+                   "w_SEABED" = 9.5/6,       
+                   "w_OBST" = 9.5/6)       
+
+Suitability(lcs.weight, SS.lcs, LCOE.exclusion = TRUE)
+
+SS.lcs.No.Action <- unname(summary(No.Action.dt$SS.lcs)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.lcs.vect <- Scores.vect("All","All","All","All", col.name = "SS.lcs", include.NO = FALSE)
+
+SS.lcs.below <- sum(SS.lcs.vect[!is.na(SS.lcs.vect)] <= SS.lcs.No.Action) #number of elements below the no action score
+SS.lcs.below.share <- SS.lcs.below/(length(SS.lcs.vect[!is.na(SS.lcs.vect)]))
+SS.lcs.above <- sum(SS.lcs.vect[!is.na(SS.lcs.vect)] > SS.lcs.No.Action)
+SS.lcs.above.share <- SS.lcs.above/(length(SS.lcs.vect[!is.na(SS.lcs.vect)]))
+
+##### Visualize the distribution
+summary(SS.lcs.vect) - SS.lcs.No.Action
+hist((SS.lcs.vect-SS.lcs.No.Action)/1000000, breaks = "FD", xlim = c(-5,5), main = "Low Concern Suitability Scores (difference from No Action)", xlab = "Suitability Score Difference")
+abline(v = 0, col = 'red', lwd = 2)
+
+### Effect of Plant Size
+SS.lcs.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+SS.lcs.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.lcs", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.lcs.vect-SS.lcs.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.lcs.200-SS.lcs.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.lcs.400-SS.lcs.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.lcs.600-SS.lcs.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.lcs.800-SS.lcs.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.lcs.1000-SS.lcs.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.lcs.1200-SS.lcs.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.lcs.1400-SS.lcs.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-3,3), main = "Low Concern Boxplots", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "Plant Size (MW)")
+mtext("Difference from\nNo-Action Score", side = 2, line = 2)
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+
+```{r Suitability Score Results - Medium Concern Skewed Weights (baseline stakeholder weights), fig.width= 8, fig.asp=0.45}
+
+SS.stk.No.Action <- unname(summary(No.Action.dt$SS.stk)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.stk.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+SS.stk.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.stk", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.stk.vect-SS.stk.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.stk.200-SS.stk.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.stk.400-SS.stk.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.stk.600-SS.stk.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.stk.800-SS.stk.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.stk.1000-SS.stk.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.stk.1200-SS.stk.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.stk.1400-SS.stk.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-3,3), main = "Medium Concern Boxplots (Baseline Stakeholder Weights)", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "Plant Size (MW)")
+mtext("Difference from\nNo-Action Score", side = 2, line = 2)
+abline(h = 0, col = 'red', lwd = 2)
+```
+```{r Suitability Score Results - Uniform Weights, fig.width= 8, fig.asp=0.45}
+
+SS.unif.No.Action <- unname(summary(No.Action.dt$SS.unif)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.unif.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+SS.unif.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.unif", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.unif.vect-SS.unif.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.unif.200-SS.unif.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.unif.400-SS.unif.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.unif.600-SS.unif.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.unif.800-SS.unif.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.unif.1000-SS.unif.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.unif.1200-SS.unif.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.unif.1400-SS.unif.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-3,3), main = "Uniform Boxplots", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "Plant Size (MW)")
+mtext("Difference from\nNo-Action Score", side = 2, line = 2)
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+```{r Suitability Score Results - Developer Weights, fig.width= 8, fig.asp=0.45}
+
+SS.dev.No.Action <- unname(summary(No.Action.dt$SS.dev.2)[4]) %>% #get the value of No Action
+  as.integer()
+
+SS.dev.200 <- Scores.vect(Turbine = 10,Plant = 200,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.400 <- Scores.vect(Turbine = 10,Plant = 400,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.600 <- Scores.vect(Turbine = 10,Plant = 600,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.800 <- Scores.vect(Turbine = 10,Plant = 800,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1000 <- Scores.vect(Turbine = 10,Plant = 1000,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1200 <- Scores.vect(Turbine = 10,Plant = 1200,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+SS.dev.1400 <- Scores.vect(Turbine = 10,Plant = 1400,SK = c("FI"),TR = c("DC"), col.name = "SS.dev.2", include.NO = FALSE)
+
+# A <- data.frame('All_Data' = (SS.dev.vect-SS.dev.No.Action)/1000000)
+B <- data.frame('200MW' = (SS.dev.200-SS.dev.No.Action)/1000000)
+C <- data.frame('400MW' = (SS.dev.400-SS.dev.No.Action)/1000000)
+D <- data.frame('600MW' = (SS.dev.600-SS.dev.No.Action)/1000000)
+E <- data.frame('800MW' = (SS.dev.800-SS.dev.No.Action)/1000000)
+G <- data.frame('1000MW' = (SS.dev.1000-SS.dev.No.Action)/1000000)
+H <- data.frame('1200MW' = (SS.dev.1200-SS.dev.No.Action)/1000000)
+I <- data.frame('1400MW' = (SS.dev.1400-SS.dev.No.Action)/1000000)
+
+
+boxplot(dplyr::bind_rows(B,C,D,E,G,H,I), ylim = c(-4,4), main = "Developer Score Boxplots", yaxs = 'i', names = c("200","400","600","800","1000","1200","1400"), ylab = "", xlab = "Plant Size (MW)")
+mtext("Difference from\nNo-Action Score", side = 2, line = 2)
+abline(h = 0, col = 'red', lwd = 2)
+```
+
+#High Value Areas
+```{r The overlap, area, capacity, and cost of developer and stakeholder weighted maps - High value areas}
+Cost_High_Value <- function(DT, turb.MW, plant.MW) {
+  n.areas <- ceiling(plant.MW/turb.MW) + 1
+  av.areas <- nrow(DT)
+  eff.plants <- av.areas/n.areas
+  act.plants <- floor(eff.plants)
+  
+  Cost <- summary(DT$Plant.OCC)
+  
+  return(list(Cost.per.plant.MUSD = Cost, Areas = av.areas, Plants = act.plants, Eff.Plants = eff.plants, Capacity.MW = eff.plants*plant.MW))
+}
+
+SS.dev.top <- 6430170 #No Action = 5000000; 90th = 6430170; 95th = 6759750
+SS.stk.top <- 8624000 #No Action = 8571428; 90th = 8624000; 95th = 8716980
+
+
+Base.Overlap.East.dt = copy(T10.1000.FI.DC)
+Base.Overlap.East.dt <- Base.Overlap.East.dt[SS.dev.2 >= SS.dev.top, ] #filter top dev scores
+Base.Overlap.East.dt <- Base.Overlap.East.dt[SS.stk >= SS.stk.top, ] #filter top stk 
+Base.Overlap.East.dt <- Base.Overlap.East.dt[Longitude >= longitude.divide, ] #filter east
+Base.Overlap.East.dt <- Base.Overlap.East.dt[Depth_mean >= -60, ] #filter fixed depth
+
+Cost_High_Value(Base.Overlap.East.dt, 10, 1000)
+
+Base.Overlap.West.dt = copy(T10.1000.DP.H2)
+Base.Overlap.West.dt <- Base.Overlap.West.dt[Longitude <= longitude.divide, ] #filter West
+Base.Overlap.West.dt <- Base.Overlap.West.dt[SS.dev.2 >= SS.dev.top, ] #filter top dev scores
+Base.Overlap.West.dt <- Base.Overlap.West.dt[SS.stk >= SS.stk.top, ] #filter top stk 
+
+Base.Overlap.West.dt <- Base.Overlap.West.dt[Depth_mean >= -1500] #filter moored depth
+
+Cost_High_Value(Base.Overlap.West.dt, 10, 1000)
+
+
+#How many high value areas when considering
+```
+
+
+#Considering an Investment Tax Credit (ITC)
+```{r FUNCTION: Normalize new ITC metrics}
+
+Normalize.DT.add <- function(DT.input, Factor = 1000000, INT = TRUE) { 
+  DT = copy(DT.input) #create a copy
+  if(INT == TRUE) { #turn everything into integers?
+    DT[ , ':=' (Plant.OCC.10.N = as.integer(Factor - (Factor*Plant.OCC.10/Max.OCC)),  #min
+                Plant.OCC.20.N = as.integer(Factor - (Factor*Plant.OCC.20/Max.OCC)),
+                Plant.OCC.30.N = as.integer(Factor - (Factor*Plant.OCC.30/Max.OCC)),
+                Plant.uOCC.10.N = as.integer(Factor - (Factor*Plant.uOCC.10/Max.uOCC)),#min
+                Plant.uOCC.20.N = as.integer(Factor - (Factor*Plant.uOCC.20/Max.uOCC)),
+                Plant.uOCC.30.N = as.integer(Factor - (Factor*Plant.uOCC.30/Max.uOCC)),
+                
+                Plant.LCOE.10.N = as.integer((Factor - as.integer(Factor*Plant.LCOE.10/Max.LCOE.2))*(Plant.LCOE.10 != 0)*(Plant.LCOE.10 <= Max.LCOE.2)),#min. If this value is equal to zero, we are producing the other energy medium and it should stay zero.Boolean Mask. will just zero out the metric once the cap is reached.
+                Plant.LCOE.20.N = as.integer((Factor - as.integer(Factor*Plant.LCOE.20/Max.LCOE.2))*(Plant.LCOE.20 != 0)*(Plant.LCOE.20 <= Max.LCOE.2)),
+                Plant.LCOE.30.N = as.integer((Factor - as.integer(Factor*Plant.LCOE.30/Max.LCOE.2))*(Plant.LCOE.30 != 0)*(Plant.LCOE.30 <= Max.LCOE.2)),
+
+                Plant.LCOH2.10.N = as.integer((Factor - as.integer(Factor*Plant.LCOH2.10/Max.LCOH2))*(Plant.LCOH2.10 != 0)), #min. If this value is equal to zero, we are producing the other energy medium and it should stay zero
+                Plant.LCOH2.20.N = as.integer((Factor - as.integer(Factor*Plant.LCOH2.20/Max.LCOH2))*(Plant.LCOH2.20 != 0)),
+                Plant.LCOH2.30.N = as.integer((Factor - as.integer(Factor*Plant.LCOH2.30/Max.LCOH2))*(Plant.LCOH2.30 != 0)))] 
+  } else {
+    DT[ , ':=' (Plant.OCC.10.N = Factor - (Factor*Plant.OCC.10/Max.OCC),  #min
+                Plant.OCC.20.N = Factor - (Factor*Plant.OCC.20/Max.OCC),
+                Plant.OCC.30.N = Factor - (Factor*Plant.OCC.30/Max.OCC),
+                Plant.uOCC.10.N = Factor - (Factor*Plant.uOCC.10/Max.uOCC),#min
+                Plant.uOCC.20.N = Factor - (Factor*Plant.uOCC.20/Max.uOCC),
+                Plant.uOCC.30.N = Factor - (Factor*Plant.uOCC.30/Max.uOCC),
+                
+                Plant.LCOE.10.N = (Factor - as.integer(Factor*Plant.LCOE.10/Max.LCOE.2))*(Plant.LCOE.10 != 0)*(Plant.LCOE.10 <= Max.LCOE.2),#min. If this value is equal to zero, we are producing the other energy medium and it should stay zero.Boolean Mask. will just zero out the metric once the cap is reached.
+                Plant.LCOE.20.N = (Factor - as.integer(Factor*Plant.LCOE.20/Max.LCOE.2))*(Plant.LCOE.20 != 0)*(Plant.LCOE.20 <= Max.LCOE.2),
+                Plant.LCOE.30.N = (Factor - as.integer(Factor*Plant.LCOE.30/Max.LCOE.2))*(Plant.LCOE.30 != 0)*(Plant.LCOE.30 <= Max.LCOE.2),
+
+                Plant.LCOH2.10.N = (Factor - as.integer(Factor*Plant.LCOH2.10/Max.LCOH2))*(Plant.LCOH2.10 != 0), #min. If this value is equal to zero, we are producing the other energy medium and it should stay zero
+                Plant.LCOH2.20.N = (Factor - as.integer(Factor*Plant.LCOH2.20/Max.LCOH2))*(Plant.LCOH2.20 != 0),
+                Plant.LCOH2.30.N = a(Factor - as.integer(Factor*Plant.LCOH2.30/Max.LCOH2))*(Plant.LCOH2.30 != 0))]
+  }
+
+  return(DT)
+}
+
+
+```
+
+```{r FUNCTION: Suitability scores with the ITC costs}
+Suitability.ITC <- function(weight.list, col.name, 
+                            OCC.metric = "Plant.OCC.N", 
+                            uOCC.metric = "Plant.uOCC.N", 
+                            LCOE.metric = "Plant.LCOE.N3", 
+                            LCOH2.metric = "Plant.LCOH2.N", LCOE.exclusion = FALSE) {
+  metrics <- c(OCC.metric,uOCC.metric,"Plant.NRG.N","Plant.H2.N",LCOE.metric,LCOH2.metric,"Plant.VIZ.IMP.N","Plant.FE.IMP.N","Plant.ML.IMP.N","Plant.VES.IMP.N","Plant.SEABED.N","Plant.OBST.N")
+  
+  coeffs <- unlist(weight.list, use.names = FALSE)
+  Factor <- No.Action.dt[1, Plant.OCC.N]
+  max.H2 <- list(OCC.metric = 1,
+                 uOCC.metric = 1,
+                 "Plant.NRG.N" = 0,
+                 "Plant.H2.N" = 1,
+                 LCOE.metric = 0,
+                 LCOH2.metric = 1,
+                 "Plant.VIZ.IMP.N" = 1,
+                 "Plant.FE.IMP.N" = 1,
+                 "Plant.ML.IMP.N" = 1,
+                 "Plant.VES.IMP.N" = 1,
+                 "Plant.SEABED.N" = 1,
+                 "Plant.OBST.N" = 1)
+  
+  max.NRG <- list(OCC.metric = 1,
+                  uOCC.metric = 1,
+                  "Plant.NRG.N" = 1,
+                  "Plant.H2.N" = 0,
+                  LCOE.metric = 1,
+                  LCOH2.metric = 0,
+                  "Plant.VIZ.IMP.N" = 1,
+                  "Plant.FE.IMP.N" = 1,
+                  "Plant.ML.IMP.N" = 1,
+                  "Plant.VES.IMP.N" = 1,
+                  "Plant.SEABED.N" = 1,
+                  "Plant.OBST.N" = 1)
+  
+  max.NRG.SS <- unlist(max.NRG, use.names = FALSE)%*%coeffs * Factor
+  max.H2.SS <- unlist(max.H2, use.names = FALSE)%*%coeffs * Factor
+  
+  if(max.NRG.SS != max.H2.SS) stop("The chosen weights are invalid")
+  
+  cat("Max Suitability Score =", max.NRG.SS)
+  
+  cont <- readline(prompt = "Continue? (Yes/No): ")
+  
+  if(cont == "No") {
+    message("The execution has been terminated.")
+    return()
+  }
+  
+  col.name <- deparse(substitute(col.name))
+    
+  suppressWarnings({
+    
+    # No.Action.dt[ , (col.name) := as.integer(as.matrix(No.Action.dt[ , ..metrics])%*%coeffs)]
+    
+    Turbine <- Turbine.sizes
+    Plant <- Plant.sizes
+    SK <- Station.keeping
+    TR <- Transmission
+    
+    All.DTs <- expand.grid(Turbine,Plant,SK,TR)
+    
+    for(i in 1:nrow(All.DTs)) {
+      #get the name of the DT as a character string
+      this.dt.name <- paste("T",All.DTs$Var1[i],".",All.DTs$Var2[i],".",as.character(All.DTs$Var3[i]),".",as.character(All.DTs$Var4[i]), sep = "")
+      #get the actual dt object
+      this.dt <- get(as.character(this.dt.name))     #this will give an error if the DT is not found
+      
+      
+      if(LCOE.exclusion == TRUE) {
+        #if we apply the LCOE exclusion criteria, if the LCOE metric is zero or negative (corresponding to normalization method 2 and 3 in "Normalize" function), it converts the whole suitability metric to NA.
+        this.dt[ , (col.name) := ifelse(Plant.LCOE.N3 <= 0 & Plant.LCOH2.N <= 0, NA, as.integer(as.matrix(this.dt[ , ..metrics])%*%coeffs))]
+      } else {
+        this.dt[ , (col.name) := as.integer(as.matrix(this.dt[ , ..metrics])%*%coeffs)]
+      }
+      
+      #finally, assign the data generated in this function to the actual dataframe.
+      assign(this.dt.name, this.dt)
+      rm(this.dt)
+
+    }
+  })
+}
+
+```
+
+```{r EXECUTE: Add columns for the effects of an ITC}
+
+
+#Loop through columns to set order
+Plant.sizes <- c(1000,1400)#c(200,600,1000,1400)
+Turbine.sizes <- c(10,15)
+Station.keeping <- c("MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+for(i in 1:nrow(My.DTs)) {
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+  this.SK <- My.DTs$Var3[i]
+  this.TR <- My.DTs$Var4[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+  
+  ##recalculate Plant.OCC, Plant.uOCC, Plant.LCOE, and Plant.LCOH2
+  this.dt[ , Plant.OCC.10 := Plant.OCC*0.9]
+  this.dt[ , Plant.OCC.20 := Plant.OCC*0.8]
+  this.dt[ , Plant.OCC.30 := Plant.OCC*0.7]
+  this.dt[ , Plant.uOCC.10 := Plant.uOCC*0.9]
+  this.dt[ , Plant.uOCC.20 := Plant.uOCC*0.8]
+  this.dt[ , Plant.uOCC.30 := Plant.uOCC*0.7]
+  this.dt[ , Plant.LCOE.10 := 0]
+  this.dt[ , Plant.LCOE.20 := 0]
+  this.dt[ , Plant.LCOE.30 := 0]
+  this.dt[ , Plant.LCOH2.10 := 0]
+  this.dt[ , Plant.LCOH2.20 := 0]
+  this.dt[ , Plant.LCOH2.30 := 0]
+  
+  if(this.TR == "DC"){
+    this.dt[ , Plant.LCOE.10 := PLANT*(mapply(LCOE, OCC = Plant.OCC.10, plant.MW = this.size, ann.energy = Plant.NRG))] #in USD/MWh
+    this.dt[ , Plant.LCOE.20 := PLANT*(mapply(LCOE, OCC = Plant.OCC.20, plant.MW = this.size, ann.energy = Plant.NRG))]
+    this.dt[ , Plant.LCOE.30 := PLANT*(mapply(LCOE, OCC = Plant.OCC.30, plant.MW = this.size, ann.energy = Plant.NRG))]
+  }
+  
+  if(this.TR == "H2"){
+    this.dt[ , Plant.LCOH2.10 := PLANT*(mapply(LCOE, OCC = Plant.OCC.10, plant.MW = this.size, ann.energy = Plant.H2))] #in USD/MWh
+    this.dt[ , Plant.LCOH2.20 := PLANT*(mapply(LCOE, OCC = Plant.OCC.20, plant.MW = this.size, ann.energy = Plant.H2))]
+    this.dt[ , Plant.LCOH2.30 := PLANT*(mapply(LCOE, OCC = Plant.OCC.30, plant.MW = this.size, ann.energy = Plant.H2))]
+  }
+  #recalculate new normalized metrics
+  
+  this.dt <- Normalize.DT.add(this.dt, Factor = 1000000, INT = TRUE)
+      
+  #assign this.dt to its original dt name
+  assign(this.dt.name, this.dt)
+
+  rm(this.dt) #clear space
+  
+  if(i %% 10 == 0) { #for every 10 DTs
+    finish(1)
+    print(i)
+  }
+  
+}
+
+finish(5)
+
+#recalculate new suitability scores
+
+#10% ITC
+Suitability.ITC(dev.weight, SS.dev.ITC10, 
+                OCC.metric = "Plant.OCC.10.N",
+                uOCC.metric = "Plant.uOCC.10.N",
+                LCOE.metric = "Plant.LCOE.10.N", 
+                LCOH2.metric = "Plant.LCOH2.10.N", LCOE.exclusion = TRUE)
+
+#20% ITC
+Suitability.ITC(dev.weight, SS.dev.ITC20, 
+                OCC.metric = "Plant.OCC.20.N",
+                uOCC.metric = "Plant.uOCC.20.N",
+                LCOE.metric = "Plant.LCOE.20.N", 
+                LCOH2.metric = "Plant.LCOH2.20.N", LCOE.exclusion = TRUE)
+
+#30% ITC
+Suitability.ITC(dev.weight, SS.dev.ITC30, 
+                OCC.metric = "Plant.OCC.30.N",
+                uOCC.metric = "Plant.uOCC.30.N",
+                LCOE.metric = "Plant.LCOE.30.N", 
+                LCOH2.metric = "Plant.LCOH2.30.N", LCOE.exclusion = TRUE)
+
+```
+
+
+```{r EXECUTE: Save Data Tables with ITC data}
+#Loop through columns to set order
+Plant.sizes <- 1000
+Turbine.sizes <- 10
+Station.keeping <- c("MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+for(i in 1:nrow(My.DTs)) {
+  #get the value chain details
+  this.turb <- My.DTs$Var1[i]
+  this.size <- My.DTs$Var2[i]
+  this.SK <- My.DTs$Var3[i]
+  this.TR <- My.DTs$Var4[i]
+
+  #get the name of the DT as a character string
+  this.dt.name <- paste("T",this.turb,".",this.size,".",this.SK,".",this.TR, sep = "")
+  #check if the object exists
+  if(exists(as.character(this.dt.name)) == FALSE) {
+    cat(this.dt)
+    cont <- readline(prompt = "This Data Table does not exist, Continue? (Yes/No): ")
+    
+    if(cont == "No") {
+      message("The execution has been terminated.")
+      return()
+    } else {
+      next      #go to the next data table if we decide to continue
+    }
+    
+  }
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.name)) #this will give an error if the DT is not found
+  
+  #### save the DT
+  this.filepath <- paste("~/",this.dt.name,".csv",sep = "")
+  
+  write.csv(this.dt, this.filepath) #save the csv to the given filepath
+}
+```
+
+```{r EXECUTE: Save Shapefiles with ITC Data}
+# library(sf)
+# #Loop through columns to set order
+Plant.sizes <- 1000#c(1000,1400)
+Turbine.sizes <- 10#c(10,15)
+Station.keeping <- c("MO","DP")
+Transmission <- c("DC","H2")
+
+My.DTs <- expand.grid(Turbine.sizes,Plant.sizes,Station.keeping,Transmission)
+
+#specify names of columns to merge to shapefiles.
+col.merge.ITC <- c("ID","Depth_mean","Shore_dist","SS.stk","SS.dev.2","SS.dev.ITC10","SS.dev.ITC20","SS.dev.ITC30")
+
+old.names.ITC <- c("id","Depth_mean","Shore_dist","SS.stk","SS.dev.2","SS.dev.ITC10","SS.dev.ITC20","SS.dev.ITC30")
+
+new.names.ITC <- c("ID","DEPTH","DIST","SS_stk","SS_dev_ITC0","SS_dev_ITC10","SS_dev_ITC20","SS_dev_ITC30")
+
+for(i in 1:nrow(My.DTs)) {
+  #get the name of the DT as a character string
+  this.dt.str <- paste("T",My.DTs$Var1[i],".",My.DTs$Var2[i],".",as.character(My.DTs$Var3[i]),".",as.character(My.DTs$Var4[i]), sep = "")
+  #get the actual dt object
+  this.dt <- get(as.character(this.dt.str))     #this will give an error if the DT is not found
+  
+  #attach shapefile polygons and convert to a shapefile
+  this.sf <- Add.Geometry(this.dt, col.merge = col.merge.ITC, old.names = old.names.ITC, new.names = new.names.ITC)
+  #assemble the filepath where to save this sf.
+  file.path.sf <- paste("~/",as.character(this.dt.str),"_ITC.shp", sep = "")
+  #save the sf object type to the file.path (external SSD)
+  st_write(this.sf, file.path.sf, append = FALSE)
+  #remove the sf to save space
+  rm(this.sf)
+  #optional - remove the data.table as well to save some space
+  # rm(this.dt)
+  print(i)
+}
+
+```
